@@ -1,0 +1,9 @@
+# Add under scrape_configs: in prometheus.yml
+  - job_name: pqproxy
+    scrape_interval: 15s
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - 127.0.0.1:9108
+        labels:
+          service: pqproxy

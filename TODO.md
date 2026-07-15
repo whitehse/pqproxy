@@ -9,7 +9,7 @@ Further work to explore. Ordered roughly by dependency.
 - [x] CMake skeleton linking `../../pique`
 - [x] Stub `rewrite_engine` using pique inject/pipeline APIs
 - [x] CLI flags for listen/TLS/plain
-- [ ] Config schema (YAML via libyaml): listen addr, pool sizes, group map, identity slot
+- [x] Config schema (YAML via libyaml): listen addr, pool sizes, group map, identity slot
 - [ ] Structured logging (stderr JSON or syslog) — app-side only
 
 ## I/O and TLS
@@ -30,7 +30,7 @@ Further work to explore. Ordered roughly by dependency.
 - [x] Mock dialectic test (`test_backend_pool`)
 - [x] Full SCRAM-SHA-256 warm-up (`scram_client.c`, OpenSSL PBKDF2/HMAC)
 - [x] Per-group login (`--backend-group-login`, `--backend-groups`, lazy open)
-- [ ] Fair scheduling when many frontends share one backend
+- [x] Fair scheduling when many frontends share one backend (RR checkout + FE wait ring)
 - [x] Async backend I/O on io_uring (OP_BE_SEND/RECV, nonblock pool)
 - [x] Live SCRAM against ephemeral Postgres (`scram_live_pg` / run_live_scram_test.sh)
 - [x] Health check / reconnect on backend ErrorResponse / EOF
@@ -49,7 +49,7 @@ Further work to explore. Ordered roughly by dependency.
 
 - [x] Load test harness (many concurrent fake CPE clients) — `tests/load_harness.c`
 - [x] Metrics: active frontends, pool wait, inject failures (counters + gauges)
-- [ ] systemd unit + example configs
+- [x] systemd unit + example configs (`deploy/pqproxy.service`, `config/*.yaml`)
 - [x] Integration test against real Postgres RLS policies (`rls_integration`, `e2e_proxy_rls`)
 
 ## Library follow-ups (track in pique/TODO.md too)
@@ -65,4 +65,4 @@ Further work to explore. Ordered roughly by dependency.
 - [x] RLS/inject integration against ephemeral Postgres (`rls_integration`)
 - [x] Prometheus /metrics HTTP (`metrics_http.c`, `--metrics-http`, default `:9108`)
 - [x] Full TCP e2e: pqproxy + backend + load + metrics + mTLS smoke (`run_e2e_proxy.sh`)
-- [ ] Dashboard examples
+- [x] Dashboard examples (`deploy/grafana/pqproxy-dashboard.json`)

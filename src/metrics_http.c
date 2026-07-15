@@ -72,6 +72,15 @@ int pqproxy_metrics_prometheus_format(char *out, size_t out_len)
         "# HELP pqproxy_maintain_rewarmed_total Backends re-warmed by maintain\n"
         "# TYPE pqproxy_maintain_rewarmed_total counter\n"
         "pqproxy_maintain_rewarmed_total %llu\n"
+        "# HELP pqproxy_fair_waits_total Frontends parked waiting for backend\n"
+        "# TYPE pqproxy_fair_waits_total counter\n"
+        "pqproxy_fair_waits_total %llu\n"
+        "# HELP pqproxy_fair_schedules_total Waiters granted a backend (RR)\n"
+        "# TYPE pqproxy_fair_schedules_total counter\n"
+        "pqproxy_fair_schedules_total %llu\n"
+        "# HELP pqproxy_pool_waiters Frontends currently waiting for a backend\n"
+        "# TYPE pqproxy_pool_waiters gauge\n"
+        "pqproxy_pool_waiters %zu\n"
         "# HELP pqproxy_live_backends Live backend connections\n"
         "# TYPE pqproxy_live_backends gauge\n"
         "pqproxy_live_backends %zu\n"
@@ -90,6 +99,9 @@ int pqproxy_metrics_prometheus_format(char *out, size_t out_len)
         (unsigned long long)m.reconnects,
         (unsigned long long)m.maintain_ticks,
         (unsigned long long)m.maintain_rewarmed,
+        (unsigned long long)m.fair_waits,
+        (unsigned long long)m.fair_schedules,
+        m.pool_waiters,
         m.live_backends,
         m.active_frontends);
     if (n < 0 || (size_t)n >= out_len) {
@@ -106,8 +118,8 @@ static void *metrics_http_thread(void *arg)
         socklen_t clen = sizeof(cli);
         int cfd;
         char req[1024];
-        char body[4096];
-        char resp[4608];
+        char body[6144];
+        char resp[6656];
         ssize_t nr;
         int blen;
 

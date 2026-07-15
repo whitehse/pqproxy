@@ -1,0 +1,32 @@
+# Local development config (plain TCP, no mTLS).
+# Example:
+#   ./build/pqproxy --config config/pqproxy.dev.yaml \
+#       --backend 127.0.0.1:5432 --backend-user postgres
+
+listen:
+  host: 127.0.0.1
+  port: 6432
+
+tls:
+  plain: true
+
+identity:
+  slot: 0
+
+backend:
+  host: 127.0.0.1
+  port: 5432
+  user: postgres
+  password: ""
+  database: postgres
+  pool_size: 4
+  group_login: false
+  lazy_group: true
+
+metrics:
+  log_ms: 10000
+  http: "127.0.0.1:9108"
+
+maintain_ms: 5000
+quiet: false
+fair_schedule: true

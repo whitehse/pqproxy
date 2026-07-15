@@ -99,6 +99,7 @@ typedef struct {
     int         metrics_log_interval_ms; /* stderr metrics; 0=off, default 30000 */
     const char *metrics_http_host;  /* default 127.0.0.1; NULL with port 0 = off */
     uint16_t    metrics_http_port;  /* 0 = disable HTTP /metrics (default 9108) */
+    int         fair_schedule;      /* RR among frontends waiting on pool (default 1) */
 } pqproxy_config_t;
 
 void pqproxy_config_defaults(pqproxy_config_t *cfg);
@@ -122,8 +123,11 @@ typedef struct {
     uint64_t backend_wait_ns_total; /* sum of pipeline wait times */
     uint64_t backend_wait_samples;
     uint64_t backend_wait_ns_max;
+    uint64_t fair_waits;            /* frontend parked waiting for backend */
+    uint64_t fair_schedules;        /* waiter granted a backend */
     size_t   live_backends;         /* gauge: filled on snapshot */
     size_t   active_frontends;      /* gauge */
+    size_t   pool_waiters;          /* gauge: frontends waiting for pool */
 } pqproxy_metrics_t;
 
 void pqproxy_metrics_get(pqproxy_metrics_t *out);

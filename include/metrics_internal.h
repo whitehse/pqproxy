@@ -14,6 +14,9 @@ void pqproxy_metrics_note_fe_q_depth(size_t depth);
 void pqproxy_metrics_inc_reconnects(unsigned n);
 void pqproxy_metrics_inc_maintain(unsigned rewarmed);
 void pqproxy_metrics_note_backend_wait_ns(uint64_t ns);
+void pqproxy_metrics_inc_fair_waits(void);
+void pqproxy_metrics_inc_fair_schedules(void);
 void pqproxy_metrics_set_gauges(size_t live_be, size_t active_fe);
+void pqproxy_metrics_set_pool_waiters(size_t n);
 
 #endif

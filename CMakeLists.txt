@@ -19,11 +19,28 @@ find_package(OpenSSL REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(URING REQUIRED liburing)
 
+set(LIBYAML_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../libyaml" CACHE PATH "Path to pure-C libyaml")
+if(NOT EXISTS "${LIBYAML_ROOT}/include/yaml.h")
+    message(FATAL_ERROR "libyaml not found at LIBYAML_ROOT=${LIBYAML_ROOT}")
+endif()
+
 add_library(pqwire STATIC
     ${PIQUE_ROOT}/src/pqwire.c
     ${PIQUE_ROOT}/src/scram.c
 )
 target_include_directories(pqwire PUBLIC ${PIQUE_ROOT}/include)
+
+# Prefer prebuilt static lib from sibling libyaml/build; else compile sources.
+if(EXISTS "${LIBYAML_ROOT}/build/libyaml.a")
+    add_library(yaml_local STATIC IMPORTED)
+    set_target_properties(yaml_local PROPERTIES
+        IMPORTED_LOCATION "${LIBYAML_ROOT}/build/libyaml.a"
+        INTERFACE_INCLUDE_DIRECTORIES "${LIBYAML_ROOT}/include"
+    )
+else()
+    add_library(yaml_local STATIC ${LIBYAML_ROOT}/src/yaml.c)
+    target_include_directories(yaml_local PUBLIC ${LIBYAML_ROOT}/include)
+endif()
 
 add_library(pqproxy_core STATIC
     src/rewrite_engine.c
@@ -34,6 +51,7 @@ add_library(pqproxy_core STATIC
     src/backend_pool.c
     src/metrics.c
     src/metrics_http.c
+    src/config_yaml.c
     src/iouring_loop.c
 )
 target_include_directories(pqproxy_core PUBLIC
@@ -41,9 +59,11 @@ target_include_directories(pqproxy_core PUBLIC
 )
 target_include_directories(pqproxy_core PRIVATE
     ${URING_INCLUDE_DIRS}
+    ${LIBYAML_ROOT}/include
 )
 target_link_libraries(pqproxy_core PUBLIC
     pqwire
+    yaml_local
     OpenSSL::SSL
     OpenSSL::Crypto
     ${URING_LIBRARIES}
@@ -90,6 +110,10 @@ add_test(NAME metrics COMMAND test_metrics)
 add_executable(test_metrics_http tests/test_metrics_http.c)
 target_link_libraries(test_metrics_http PRIVATE pqproxy_core)
 add_test(NAME metrics_http COMMAND test_metrics_http)
+
+add_executable(test_config_yaml tests/test_config_yaml.c)
+target_link_libraries(test_config_yaml PRIVATE pqproxy_core)
+add_test(NAME config_yaml COMMAND test_config_yaml)
 
 add_executable(load_harness tests/load_harness.c)
 target_link_libraries(load_harness PRIVATE pqproxy_core)

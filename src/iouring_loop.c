@@ -44,7 +44,8 @@ typedef enum {
 typedef enum {
     BE_IDLE = 0,
     BE_SENDING,
-    BE_READING
+    BE_READING,
+    BE_WAITING_POOL  /* queued for fair backend checkout */
 } be_wait_t;
 
 /* Queued frontend work while a backend pipeline is in flight */
@@ -119,6 +120,7 @@ typedef struct {
     SSL_CTX                *tls_ctx;
     pqproxy_backend_pool_t *pool;
     int                     async_backend; /* 1 = io_uring backend path */
+    int                     fair_schedule; /* RR waiters when pool busy */
     struct io_uring         ring;
     int                     listen_fd;
     conn_t                  conns[PQPROXY_MAX_CONNS];
@@ -127,6 +129,11 @@ typedef struct {
     volatile sig_atomic_t   stop;
     uint64_t                last_maintain_ms;
     uint64_t                last_metrics_ms;
+    /* Fair pool wait ring: frontend slots waiting for a free backend */
+    int                     waiters[PQPROXY_MAX_CONNS];
+    size_t                  wait_head;
+    size_t                  wait_tail;
+    size_t                  wait_count;
 } server_t;
 
 static uint64_t mono_ms(void)
@@ -175,7 +182,7 @@ static void server_tick(server_t *srv)
     }
     if (mlog > 0 && (now - srv->last_metrics_ms) >= (uint64_t)mlog) {
         pqproxy_metrics_t m;
-        char line[512];
+        char line[640];
         size_t live = srv->pool ? pqproxy_backend_pool_live_count(srv->pool) : 0;
         pqproxy_metrics_set_gauges(live, count_active_frontends(srv));
         pqproxy_metrics_get(&m);
@@ -190,6 +197,11 @@ static server_t *g_server;
 static void feq_clear_all(conn_t *c);
 static int drain_fe_queue(server_t *srv, conn_t *c);
 static int queue_plain_send(server_t *srv, conn_t *c, const uint8_t *data, size_t len);
+static int waiters_push(server_t *srv, conn_t *c);
+static void waiters_remove(server_t *srv, int slot);
+static int fair_schedule_waiters(server_t *srv);
+static int park_for_backend(server_t *srv, conn_t *c);
+static int after_backend_release(server_t *srv, conn_t *c);
 
 static void on_signal(int sig)
 {
@@ -284,9 +296,12 @@ static void close_conn(server_t *srv, conn_t *c)
     if (!c || c->state == CS_FREE) {
         return;
     }
+    waiters_remove(srv, c->slot);
     if (c->be && srv->pool) {
         pqproxy_backend_async_finish(srv->pool, c->be, 1);
         c->be = NULL;
+        /* Free backend may unblock another frontend */
+        (void)fair_schedule_waiters(srv);
     }
     if (c->ssl) {
         SSL_free(c->ssl);
@@ -307,7 +322,6 @@ static void close_conn(server_t *srv, conn_t *c)
     c->be_start_ns = 0;
     feq_clear_all(c);
     pqproxy_metrics_inc_closes();
-    (void)srv;
 }
 
 static int submit_recv(server_t *srv, conn_t *c)
@@ -521,6 +535,131 @@ static int drain_frontend_out(server_t *srv, conn_t *c)
     return 0;
 }
 
+static int waiters_push(server_t *srv, conn_t *c)
+{
+    size_t i;
+    if (!srv || !c || !srv->fair_schedule) {
+        return -1;
+    }
+    /* already waiting? */
+    for (i = 0; i < srv->wait_count; i++) {
+        size_t idx = (srv->wait_head + i) % PQPROXY_MAX_CONNS;
+        if (srv->waiters[idx] == c->slot) {
+            return 0;
+        }
+    }
+    if (srv->wait_count >= PQPROXY_MAX_CONNS) {
+        return -1;
+    }
+    srv->waiters[srv->wait_tail] = c->slot;
+    srv->wait_tail = (srv->wait_tail + 1) % PQPROXY_MAX_CONNS;
+    srv->wait_count++;
+    pqproxy_metrics_inc_fair_waits();
+    pqproxy_metrics_set_pool_waiters(srv->wait_count);
+    return 0;
+}
+
+static void waiters_remove(server_t *srv, int slot)
+{
+    size_t i, n;
+    size_t new_head, new_count;
+    int tmp[PQPROXY_MAX_CONNS];
+    if (!srv || srv->wait_count == 0) {
+        return;
+    }
+    n = 0;
+    for (i = 0; i < srv->wait_count; i++) {
+        size_t idx = (srv->wait_head + i) % PQPROXY_MAX_CONNS;
+        if (srv->waiters[idx] != slot) {
+            tmp[n++] = srv->waiters[idx];
+        }
+    }
+    if (n == srv->wait_count) {
+        return;
+    }
+    new_head = 0;
+    new_count = n;
+    for (i = 0; i < n; i++) {
+        srv->waiters[i] = tmp[i];
+    }
+    srv->wait_head = new_head;
+    srv->wait_tail = new_count % PQPROXY_MAX_CONNS;
+    srv->wait_count = new_count;
+    pqproxy_metrics_set_pool_waiters(srv->wait_count);
+}
+
+/** Park frontend until a backend becomes available (fair RR). */
+static int park_for_backend(server_t *srv, conn_t *c)
+{
+    c->be_wait = BE_WAITING_POOL;
+    if (waiters_push(srv, c) != 0) {
+        c->be_wait = BE_IDLE;
+        return -1;
+    }
+    return 0;
+}
+
+static int fair_schedule_waiters(server_t *srv)
+{
+    size_t attempts;
+    int started = 0;
+    if (!srv || !srv->fair_schedule || !srv->pool || !srv->async_backend) {
+        return 0;
+    }
+    attempts = srv->wait_count;
+    while (attempts-- > 0 && srv->wait_count > 0) {
+        int slot = srv->waiters[srv->wait_head];
+        conn_t *wc;
+        srv->wait_head = (srv->wait_head + 1) % PQPROXY_MAX_CONNS;
+        srv->wait_count--;
+        pqproxy_metrics_set_pool_waiters(srv->wait_count);
+
+        if (slot < 0 || slot >= PQPROXY_MAX_CONNS) {
+            continue;
+        }
+        wc = &srv->conns[slot];
+        if (wc->state == CS_FREE || wc->be_wait != BE_WAITING_POOL) {
+            continue;
+        }
+        /* Try to start next queued work (typically FEQ_BIND). */
+        if (wc->fe_q_count == 0) {
+            wc->be_wait = BE_IDLE;
+            continue;
+        }
+        wc->be_wait = BE_IDLE;
+        if (drain_fe_queue(srv, wc) != 0) {
+            continue;
+        }
+        if (wc->be_wait == BE_SENDING || wc->be_wait == BE_READING) {
+            pqproxy_metrics_inc_fair_schedules();
+            started++;
+            /* One grant per free backend release; pool may have more free. */
+            continue;
+        }
+        if (wc->be_wait == BE_IDLE && wc->fe_q_count > 0) {
+            /* Still needs a backend — re-queue at tail */
+            (void)park_for_backend(srv, wc);
+        }
+    }
+    return started;
+}
+
+/**
+ * After releasing a backend: prefer other waiters (fairness), then drain self.
+ */
+static int after_backend_release(server_t *srv, conn_t *c)
+{
+    c->be_wait = BE_IDLE;
+    c->got_execute = c->got_sync = 0;
+    if (srv->fair_schedule && srv->wait_count > 0) {
+        (void)fair_schedule_waiters(srv);
+    }
+    if (c->be_wait == BE_IDLE && c->fe_q_count > 0) {
+        return drain_fe_queue(srv, c);
+    }
+    return drain_frontend_out(srv, c);
+}
+
 static int submit_be_send(server_t *srv, conn_t *c);
 static int submit_be_recv(server_t *srv, conn_t *c);
 
@@ -551,9 +690,7 @@ static int backend_async_complete(server_t *srv, conn_t *c)
         pqproxy_backend_async_finish(srv->pool, c->be, 0);
         c->be = NULL;
     }
-    c->be_wait = BE_IDLE;
-    c->got_execute = c->got_sync = 0;
-    return drain_fe_queue(srv, c);
+    return after_backend_release(srv, c);
 }
 
 static int backend_async_fail(server_t *srv, conn_t *c)
@@ -567,12 +704,14 @@ static int backend_async_fail(server_t *srv, conn_t *c)
         pqproxy_backend_async_finish(srv->pool, c->be, 1);
         c->be = NULL;
     }
-    c->be_wait = BE_IDLE;
     c->be_resp_len = 0;
     (void)pqwire_send_error_response(c->frontend, "ERROR", "08006",
                                      "backend pipeline failed");
     (void)pqwire_send_ready_for_query(c->frontend);
-    return drain_frontend_out(srv, c);
+    if (drain_frontend_out(srv, c) != 0) {
+        return -1;
+    }
+    return after_backend_release(srv, c);
 }
 
 static int submit_be_send(server_t *srv, conn_t *c)
@@ -751,6 +890,19 @@ static int drain_fe_queue(server_t *srv, conn_t *c)
                     c->draining_queue = 0;
                     return drain_frontend_out(srv, c);
                 }
+                /* Pool busy: re-queue bind at head and park for fair RR. */
+                if (srv->fair_schedule) {
+                    /* Push back to front of queue */
+                    if (c->fe_q_count < FE_Q_MAX) {
+                        c->fe_q_head = (c->fe_q_head + FE_Q_MAX - 1) % FE_Q_MAX;
+                        c->fe_q[c->fe_q_head] = it;
+                        c->fe_q_count++;
+                        memset(&it, 0, sizeof(it)); /* ownership kept in queue */
+                        (void)park_for_backend(srv, c);
+                        c->draining_queue = 0;
+                        return drain_frontend_out(srv, c);
+                    }
+                }
             }
             if (srv->pool && c->identity_ready) {
                 /* Blocking fallback via reconstructed bind */
@@ -869,6 +1021,12 @@ static int process_frontend(server_t *srv, conn_t *c)
             if (srv->pool && c->identity_ready && srv->async_backend) {
                 if (start_async_bind_from_event(srv, c, &ev.payload.bind) == 0) {
                     break;
+                }
+                if (srv->fair_schedule) {
+                    if (feq_push_bind(c, &ev.payload.bind) == 0 &&
+                        park_for_backend(srv, c) == 0) {
+                        break;
+                    }
                 }
                 if (!srv->cfg->quiet) {
                     fprintf(stderr, "pqproxy: async backend begin failed; try sync\n");
@@ -1188,6 +1346,7 @@ void pqproxy_config_defaults(pqproxy_config_t *cfg)
     cfg->metrics_log_interval_ms = 30000;
     cfg->metrics_http_host = "127.0.0.1";
     cfg->metrics_http_port = 9108;
+    cfg->fair_schedule = 1;
 }
 
 int pqproxy_run(const pqproxy_config_t *cfg)
@@ -1207,6 +1366,7 @@ int pqproxy_run(const pqproxy_config_t *cfg)
         return 1;
     }
     srv->cfg = cfg;
+    srv->fair_schedule = cfg->fair_schedule;
     g_server = srv;
 
     signal(SIGINT, on_signal);

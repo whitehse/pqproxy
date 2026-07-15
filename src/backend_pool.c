@@ -66,6 +66,7 @@ struct pqproxy_backend_pool {
     size_t          max_conns;
     pqproxy_backend_conn_t *conns;
     size_t          n;
+    size_t          rr_cursor; /* fair checkout rotation */
 };
 
 void pqproxy_backend_config_defaults(pqproxy_backend_config_t *cfg)
@@ -727,49 +728,55 @@ pqproxy_backend_conn_t *pqproxy_backend_checkout(pqproxy_backend_pool_t *pool,
                                                  const char *group)
 {
     size_t i;
+    size_t start;
     pqproxy_backend_conn_t *fallback = NULL;
-    if (!pool) {
+    if (!pool || pool->max_conns == 0) {
         return NULL;
     }
     /* Opportunistic re-warm of idle dead slots */
     if (pool->cfg.auto_reconnect) {
         (void)pqproxy_backend_pool_maintain(pool);
     }
+    /* Round-robin start index so chatty frontends do not pin slot 0. */
+    start = pool->rr_cursor % pool->max_conns;
     for (i = 0; i < pool->max_conns; i++) {
-        pqproxy_backend_conn_t *c = &pool->conns[i];
+        size_t idx = (start + i) % pool->max_conns;
+        pqproxy_backend_conn_t *c = &pool->conns[idx];
         if (!c->alive || c->busy) {
             continue;
         }
         if (group && group[0] && strcmp(c->login_user, group) == 0) {
             pqproxy_backend_conn_t *got = checkout_try(pool, c);
             if (got) {
+                pool->rr_cursor = (idx + 1) % pool->max_conns;
                 return got;
             }
             continue;
         }
-        if (!pool->use_group_as_user && !fallback) {
-            fallback = c;
-        }
-        if (pool->use_group_as_user && !fallback) {
+        if (!fallback) {
             fallback = c;
         }
     }
     if (pool->use_group_as_user && group && group[0]) {
         for (i = 0; i < pool->max_conns; i++) {
-            pqproxy_backend_conn_t *c = &pool->conns[i];
+            size_t idx = (start + i) % pool->max_conns;
+            pqproxy_backend_conn_t *c = &pool->conns[idx];
             if (c->alive && !c->busy && strcmp(c->login_user, group) == 0) {
                 pqproxy_backend_conn_t *got = checkout_try(pool, c);
                 if (got) {
+                    pool->rr_cursor = (idx + 1) % pool->max_conns;
                     return got;
                 }
             }
         }
         if (pool->lazy_connect) {
             for (i = 0; i < pool->max_conns; i++) {
-                pqproxy_backend_conn_t *c = &pool->conns[i];
+                size_t idx = (start + i) % pool->max_conns;
+                pqproxy_backend_conn_t *c = &pool->conns[idx];
                 if (!c->alive) {
                     if (warm_one(pool, c, group) == 0) {
                         c->busy = 1;
+                        pool->rr_cursor = (idx + 1) % pool->max_conns;
                         if (!pool->cfg.quiet) {
                             fprintf(stderr, "pqproxy: lazy backend login as %s\n",
                                     group);
@@ -783,7 +790,11 @@ pqproxy_backend_conn_t *pqproxy_backend_checkout(pqproxy_backend_pool_t *pool,
         return NULL;
     }
     if (fallback) {
-        return checkout_try(pool, fallback);
+        pqproxy_backend_conn_t *got = checkout_try(pool, fallback);
+        if (got) {
+            pool->rr_cursor = ((size_t)got->slot + 1) % pool->max_conns;
+        }
+        return got;
     }
     return NULL;
 }

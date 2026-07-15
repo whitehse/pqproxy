@@ -1,0 +1,44 @@
+# Example pqproxy configuration (YAML).
+# Use: pqproxy --config /etc/pqproxy/pqproxy.yaml
+# CLI flags override values from this file.
+
+listen:
+  host: 0.0.0.0
+  port: 6432
+
+tls:
+  plain: false
+  require_mtls: true
+  cert: /etc/pqproxy/certs/server.crt
+  key: /etc/pqproxy/certs/server.key
+  ca: /etc/pqproxy/certs/ca.crt
+  # Prefer TLS 1.2 AES-GCM so kernel kTLS can arm after handshake
+  ktls_prefer: true
+
+identity:
+  # Bind parameter index overwritten with verified router_id from mTLS
+  slot: 0
+
+backend:
+  host: 127.0.0.1
+  port: 5432
+  user: postgres
+  password: ""
+  database: postgres
+  pool_size: 8
+  # Login to PostgreSQL as the client group role (RLS macro identity)
+  group_login: true
+  # Quoted CSV (unquoted commas are ambiguous in plain YAML scalars)
+  groups: "region_east,region_west"
+  lazy_group: true
+
+metrics:
+  log_ms: 30000
+  # Quote HOST:PORT (bare colons confuse plain YAML scalars)
+  http: "127.0.0.1:9108"
+
+maintain_ms: 5000
+quiet: false
+
+# Round-robin among frontends waiting for a free backend connection
+fair_schedule: true

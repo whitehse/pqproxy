@@ -1,0 +1,366 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "title": "Active frontends",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "pqproxy_active_frontends",
+          "legendFormat": "frontends",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "title": "Live backends",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "pqproxy_live_backends",
+          "legendFormat": "backends",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "title": "Pool waiters",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "pqproxy_pool_waiters",
+          "legendFormat": "waiters",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "unit": "µs" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "title": "Backend wait (avg µs)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "pqproxy_backend_wait_microseconds_avg",
+          "legendFormat": "avg",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "id": 5,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "title": "Accepts & closes (rate)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(pqproxy_accepts_total[1m])",
+          "legendFormat": "accepts/s",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(pqproxy_frontend_closes_total[1m])",
+          "legendFormat": "closes/s",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "id": 6,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "title": "Backend pipelines (rate)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(pqproxy_backend_pipelines_ok_total[1m])",
+          "legendFormat": "ok/s",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(pqproxy_backend_pipelines_fail_total[1m])",
+          "legendFormat": "fail/s",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never"
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "id": 7,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "title": "Backend pipeline wait",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "pqproxy_backend_wait_microseconds_avg",
+          "legendFormat": "avg µs",
+          "refId": "A"
+        },
+        {
+          "expr": "pqproxy_backend_wait_microseconds_max",
+          "legendFormat": "max µs",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "id": 8,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "title": "Frontend queue & fair schedule",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "pqproxy_fe_queue_high_water",
+          "legendFormat": "fe q HWM",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(pqproxy_fe_queue_full_total[1m])",
+          "legendFormat": "q full/s",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(pqproxy_fair_waits_total[1m])",
+          "legendFormat": "fair waits/s",
+          "refId": "C"
+        },
+        {
+          "expr": "rate(pqproxy_fair_schedules_total[1m])",
+          "legendFormat": "fair schedules/s",
+          "refId": "D"
+        },
+        {
+          "expr": "pqproxy_pool_waiters",
+          "legendFormat": "pool waiters",
+          "refId": "E"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "id": 9,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "title": "Backend maintain / reconnect",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(pqproxy_reconnects_total[5m])",
+          "legendFormat": "reconnects/s",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(pqproxy_maintain_rewarmed_total[5m])",
+          "legendFormat": "rewarmed/s",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(pqproxy_maintain_ticks_total[5m])",
+          "legendFormat": "maintain ticks/s",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": { "mode": "none" }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "id": 10,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "title": "Connection gauges",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "pqproxy_active_frontends",
+          "legendFormat": "active FE",
+          "refId": "A"
+        },
+        {
+          "expr": "pqproxy_live_backends",
+          "legendFormat": "live BE",
+          "refId": "B"
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["pqproxy", "postgresql", "mtls"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "pqproxy",
+  "uid": "pqproxy-overview",
+  "version": 1
+}

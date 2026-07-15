@@ -32,6 +32,7 @@ char *pqproxy_metrics_format(const pqproxy_metrics_t *m, char *out, size_t out_l
              "be_ok=%llu be_fail=%llu be_wait_us_avg=%llu be_wait_us_max=%llu "
              "fe_q_enq=%llu fe_q_full=%llu fe_q_hwm=%llu "
              "reconnects=%llu maintain_ticks=%llu rewarmed=%llu "
+             "fair_waits=%llu fair_sched=%llu pool_waiters=%zu "
              "live_be=%zu active_fe=%zu",
              (unsigned long long)m->accepts,
              (unsigned long long)m->frontend_closes,
@@ -45,6 +46,9 @@ char *pqproxy_metrics_format(const pqproxy_metrics_t *m, char *out, size_t out_l
              (unsigned long long)m->reconnects,
              (unsigned long long)m->maintain_ticks,
              (unsigned long long)m->maintain_rewarmed,
+             (unsigned long long)m->fair_waits,
+             (unsigned long long)m->fair_schedules,
+             m->pool_waiters,
              m->live_backends,
              m->active_frontends);
     return out;
@@ -85,8 +89,16 @@ void pqproxy_metrics_note_backend_wait_ns(uint64_t ns)
     }
 }
 
+void pqproxy_metrics_inc_fair_waits(void) { g_metrics.fair_waits++; }
+void pqproxy_metrics_inc_fair_schedules(void) { g_metrics.fair_schedules++; }
+
 void pqproxy_metrics_set_gauges(size_t live_be, size_t active_fe)
 {
     g_metrics.live_backends = live_be;
     g_metrics.active_frontends = active_fe;
+}
+
+void pqproxy_metrics_set_pool_waiters(size_t n)
+{
+    g_metrics.pool_waiters = n;
 }

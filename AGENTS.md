@@ -16,12 +16,13 @@ Design source: `~/new_design2.txt`.
 
 - C11, CMake ≥ 3.20
 - Static link to sibling **pique** (`libpqwire`)
-- Optional: libyaml for config
+- Sibling **libyaml** for YAML config (`--config`)
 
 ```bash
-cmake -B build -S . -DPIQUE_ROOT=$HOME/pique
+cmake -B build -S . -DPIQUE_ROOT=$HOME/pique -DLIBYAML_ROOT=$HOME/libyaml
 cmake --build build
 ctest --test-dir build
+# Dev: ./build/pqproxy --config config/pqproxy.dev.yaml --backend 127.0.0.1:5432
 ```
 
 ## Architecture
