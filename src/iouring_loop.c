@@ -177,16 +177,22 @@ static void server_tick(server_t *srv)
         int n = pqproxy_backend_pool_maintain(srv->pool);
         srv->last_maintain_ms = now;
         if (n > 0 && !srv->cfg->quiet) {
-            fprintf(stderr, "pqproxy: maintain rewarmed %d backend(s)\n", n);
+            char msg[64];
+            snprintf(msg, sizeof(msg), "rewarmed %d backend(s)", n);
+            pqproxy_log(srv->cfg, "maintain", msg);
         }
     }
     if (mlog > 0 && (now - srv->last_metrics_ms) >= (uint64_t)mlog) {
         pqproxy_metrics_t m;
-        char line[640];
+        char line[768];
         size_t live = srv->pool ? pqproxy_backend_pool_live_count(srv->pool) : 0;
         pqproxy_metrics_set_gauges(live, count_active_frontends(srv));
         pqproxy_metrics_get(&m);
-        pqproxy_metrics_format(&m, line, sizeof(line));
+        if (srv->cfg->log_json) {
+            pqproxy_metrics_format_json(&m, line, sizeof(line));
+        } else {
+            pqproxy_metrics_format(&m, line, sizeof(line));
+        }
         fprintf(stderr, "%s\n", line);
         srv->last_metrics_ms = now;
     }
@@ -1424,6 +1430,7 @@ void pqproxy_config_defaults(pqproxy_config_t *cfg)
     cfg->metrics_http_port = 9108;
     cfg->fair_schedule = 1;
     cfg->reject_simple_query = 1;
+    cfg->log_json = 0;
 }
 
 int pqproxy_run(const pqproxy_config_t *cfg)

@@ -7,6 +7,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 static pqproxy_metrics_t g_metrics;
 
@@ -52,6 +53,62 @@ char *pqproxy_metrics_format(const pqproxy_metrics_t *m, char *out, size_t out_l
              m->live_backends,
              m->active_frontends);
     return out;
+}
+
+char *pqproxy_metrics_format_json(const pqproxy_metrics_t *m, char *out, size_t out_len)
+{
+    uint64_t avg_us = 0;
+    if (!m || !out || out_len == 0) {
+        return out;
+    }
+    if (m->backend_wait_samples > 0) {
+        avg_us = (m->backend_wait_ns_total / m->backend_wait_samples) / 1000ull;
+    }
+    snprintf(out, out_len,
+             "{\"event\":\"metrics\","
+             "\"accepts\":%llu,\"closes\":%llu,"
+             "\"be_ok\":%llu,\"be_fail\":%llu,"
+             "\"be_wait_us_avg\":%llu,\"be_wait_us_max\":%llu,"
+             "\"fe_q_enq\":%llu,\"fe_q_full\":%llu,\"fe_q_hwm\":%llu,"
+             "\"reconnects\":%llu,\"maintain_ticks\":%llu,\"rewarmed\":%llu,"
+             "\"fair_waits\":%llu,\"fair_sched\":%llu,"
+             "\"pool_waiters\":%zu,\"live_be\":%zu,\"active_fe\":%zu}",
+             (unsigned long long)m->accepts,
+             (unsigned long long)m->frontend_closes,
+             (unsigned long long)m->backend_pipelines_ok,
+             (unsigned long long)m->backend_pipelines_fail,
+             (unsigned long long)avg_us,
+             (unsigned long long)(m->backend_wait_ns_max / 1000ull),
+             (unsigned long long)m->fe_queue_enqueued,
+             (unsigned long long)m->fe_queue_full,
+             (unsigned long long)m->fe_queue_high_water,
+             (unsigned long long)m->reconnects,
+             (unsigned long long)m->maintain_ticks,
+             (unsigned long long)m->maintain_rewarmed,
+             (unsigned long long)m->fair_waits,
+             (unsigned long long)m->fair_schedules,
+             m->pool_waiters,
+             m->live_backends,
+             m->active_frontends);
+    return out;
+}
+
+void pqproxy_log(const pqproxy_config_t *cfg, const char *event, const char *msg)
+{
+    time_t now = time(NULL);
+    if (!event) {
+        event = "log";
+    }
+    if (!msg) {
+        msg = "";
+    }
+    if (cfg && cfg->log_json) {
+        /* Escape is minimal: assume msg has no quotes/newlines (internal use). */
+        fprintf(stderr, "{\"ts\":%lld,\"event\":\"%s\",\"msg\":\"%s\"}\n",
+                (long long)now, event, msg);
+    } else {
+        fprintf(stderr, "pqproxy: %s: %s\n", event, msg);
+    }
 }
 
 /* Internal mutators used by iouring_loop / pool (declared in metrics_internal) */

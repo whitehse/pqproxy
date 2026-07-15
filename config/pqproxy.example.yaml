@@ -45,3 +45,6 @@ fair_schedule: true
 
 # Reject simple Query ('Q'); identity inject requires extended protocol
 reject_simple_query: true
+
+# Structured JSON logs on stderr (metrics + operational events)
+log_json: false

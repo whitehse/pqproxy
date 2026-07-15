@@ -451,6 +451,13 @@ static int apply_scalar(pqproxy_config_bundle_t *b, const char *key, const char 
         b->cfg.reject_simple_query = iv ? 0 : 1;
         return 0;
     }
+    if (strcmp(key, "log_json") == 0 || strcmp(key, "structured_log") == 0) {
+        if (parse_bool(val, &iv) != 0) {
+            FAIL("invalid bool");
+        }
+        b->cfg.log_json = iv;
+        return 0;
+    }
 #undef FAIL
     return 0; /* unknown keys ignored */
 }
@@ -507,6 +514,8 @@ static const char *const g_paths[] = {
     "reject_simple_query",
     "extended_only",
     "allow_simple_query",
+    "log_json",
+    "structured_log",
     NULL
 };
 

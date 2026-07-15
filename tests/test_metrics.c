@@ -30,6 +30,19 @@ int main(void)
     pqproxy_metrics_format(&m, line, sizeof(line));
     assert(strstr(line, "accepts=2") != NULL);
     assert(strstr(line, "be_ok=1") != NULL);
+
+    pqproxy_metrics_format_json(&m, line, sizeof(line));
+    assert(strstr(line, "\"event\":\"metrics\"") != NULL);
+    assert(strstr(line, "\"accepts\":2") != NULL);
+    assert(strstr(line, "\"be_ok\":1") != NULL);
+
+    {
+        pqproxy_config_t cfg;
+        pqproxy_config_defaults(&cfg);
+        cfg.log_json = 1;
+        pqproxy_log(&cfg, "test", "hello");
+    }
+
     printf("metrics test PASSED\n%s\n", line);
     return 0;
 }

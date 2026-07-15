@@ -115,9 +115,17 @@ typedef struct {
      * may be forwarded without identity inject (insecure; dev only).
      */
     int         reject_simple_query;
+    /** Emit operational logs as single-line JSON on stderr (default 0). */
+    int         log_json;
 } pqproxy_config_t;
 
 void pqproxy_config_defaults(pqproxy_config_t *cfg);
+
+/**
+ * Operational log line. When log_json is set, prints
+ * {"event":"...","msg":"..."} ; otherwise "pqproxy: event: msg".
+ */
+void pqproxy_log(const pqproxy_config_t *cfg, const char *event, const char *msg);
 
 /**
  * Runtime metrics (process-wide; updated by the server loop / pool).
@@ -148,6 +156,8 @@ typedef struct {
 void pqproxy_metrics_get(pqproxy_metrics_t *out);
 /** Format one-line metrics for logs. Returns out. */
 char *pqproxy_metrics_format(const pqproxy_metrics_t *m, char *out, size_t out_len);
+/** Format metrics as a single JSON object line. Returns out. */
+char *pqproxy_metrics_format_json(const pqproxy_metrics_t *m, char *out, size_t out_len);
 
 /**
  * Run the proxy accept loop (blocks until fatal error or signal).

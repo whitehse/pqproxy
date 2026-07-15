@@ -36,6 +36,7 @@ static void usage(const char *argv0)
             "  --no-fair            disable fair frontend scheduling\n"
             "  --reject-simple-query  reject simple Query 'Q' (default; extended only)\n"
             "  --allow-simple-query   insecure: forward simple Query without inject\n"
+            "  --log-json           structured JSON logs on stderr\n"
             "  --quiet              less logging\n"
             "  -h, --help           this help\n",
             argv0);
@@ -145,6 +146,10 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "pqproxy: warning: --allow-simple-query forwards 'Q' without "
                     "identity inject (insecure)\n");
+            continue;
+        }
+        if (strcmp(argv[i], "--log-json") == 0) {
+            cfg->log_json = 1;
             continue;
         }
         if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {

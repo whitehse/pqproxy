@@ -10,7 +10,7 @@ Further work to explore. Ordered roughly by dependency.
 - [x] Stub `rewrite_engine` using pique inject/pipeline APIs
 - [x] CLI flags for listen/TLS/plain
 - [x] Config schema (YAML via libyaml): listen addr, pool sizes, group map, identity slot
-- [ ] Structured logging (stderr JSON or syslog) — app-side only
+- [x] Structured logging (stderr JSON via `--log-json` / `log_json`)
 
 ## I/O and TLS
 
