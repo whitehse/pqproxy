@@ -22,8 +22,12 @@ Further work to explore. Ordered roughly by dependency.
 
 ## Connection pool
 
-- [ ] Identity-grouped pool: group → N long-lived backend conns
-- [ ] Backend SCRAM auth at pool warm-up (pique client role)
+- [x] Backend pool warm-up + checkout/checkin (`backend_pool.c`)
+- [x] Trust/cleartext auth at warm-up; CLI `--backend*` flags
+- [x] Bind → inject → pipeline → filter responses to frontend
+- [x] Mock dialectic test (`test_backend_pool`)
+- [ ] Full SCRAM-SHA-256 warm-up (when backends require it)
+- [ ] Per-group login (`--backend-use-group-as-user`) multi-role pools
 - [ ] Fair scheduling when many frontends share one backend
 - [ ] Health check / reconnect on backend ErrorResponse / EOF
 

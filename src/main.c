@@ -15,6 +15,11 @@ static void usage(const char *argv0)
             "  --plain              no TLS (development only)\n"
             "  --no-mtls            TLS without requiring client cert\n"
             "  --identity-slot N    Bind param index for router_id (default 0)\n"
+            "  --backend HOST:PORT  PostgreSQL backend for identity pool\n"
+            "  --backend-user U     backend login (default postgres)\n"
+            "  --backend-password P backend password (empty = trust)\n"
+            "  --backend-database D default postgres\n"
+            "  --backend-pool N     warmed connections (default 4)\n"
             "  --quiet              less logging\n"
             "  -h, --help           this help\n",
             argv0);
@@ -94,6 +99,35 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "--identity-slot") == 0 && i + 1 < argc) {
             cfg.identity_slot = (int16_t)atoi(argv[++i]);
+            continue;
+        }
+        if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+            char *s = argv[++i];
+            char *colon = strrchr(s, ':');
+            if (colon) {
+                *colon = '\0';
+                cfg.backend_host = s;
+                cfg.backend_port = (uint16_t)atoi(colon + 1);
+            } else {
+                cfg.backend_host = s;
+                cfg.backend_port = 5432;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--backend-user") == 0 && i + 1 < argc) {
+            cfg.backend_user = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--backend-password") == 0 && i + 1 < argc) {
+            cfg.backend_password = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--backend-database") == 0 && i + 1 < argc) {
+            cfg.backend_database = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--backend-pool") == 0 && i + 1 < argc) {
+            cfg.backend_pool_size = (size_t)atoi(argv[++i]);
             continue;
         }
         fprintf(stderr, "unknown argument: %s\n", argv[i]);

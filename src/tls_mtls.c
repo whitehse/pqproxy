@@ -34,6 +34,7 @@ SSL_CTX *pqproxy_tls_ctx_create(const pqproxy_config_t *cfg)
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
     mode = SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER;
     SSL_CTX_set_mode(ctx, mode);
+    pqproxy_tls_enable_ktls_ctx(ctx);
 
     if (SSL_CTX_use_certificate_chain_file(ctx, cfg->cert_file) != 1) {
         fprintf(stderr, "pqproxy: failed to load cert %s\n", cfg->cert_file);
@@ -105,6 +106,24 @@ SSL *pqproxy_tls_conn_new(SSL_CTX *ctx)
     BIO_set_mem_eof_return(rbio, -1);
     BIO_set_mem_eof_return(wbio, -1);
     SSL_set_bio(ssl, rbio, wbio);
+    SSL_set_accept_state(ssl);
+    return ssl;
+}
+
+SSL *pqproxy_tls_conn_new_fd(SSL_CTX *ctx, int fd)
+{
+    SSL *ssl;
+    if (!ctx || fd < 0) {
+        return NULL;
+    }
+    ssl = SSL_new(ctx);
+    if (!ssl) {
+        return NULL;
+    }
+    if (SSL_set_fd(ssl, fd) != 1) {
+        SSL_free(ssl);
+        return NULL;
+    }
     SSL_set_accept_state(ssl);
     return ssl;
 }

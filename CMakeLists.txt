@@ -29,6 +29,8 @@ add_library(pqproxy_core STATIC
     src/rewrite_engine.c
     src/identity.c
     src/tls_mtls.c
+    src/ktls.c
+    src/backend_pool.c
     src/iouring_loop.c
 )
 target_include_directories(pqproxy_core PUBLIC
@@ -55,3 +57,7 @@ add_test(NAME rewrite_engine COMMAND test_rewrite)
 add_executable(test_identity tests/test_identity.c)
 target_link_libraries(test_identity PRIVATE pqproxy_core)
 add_test(NAME identity_parse COMMAND test_identity)
+
+add_executable(test_backend_pool tests/test_backend_pool.c)
+target_link_libraries(test_backend_pool PRIVATE pqproxy_core pthread)
+add_test(NAME backend_pool COMMAND test_backend_pool)

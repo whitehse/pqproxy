@@ -83,6 +83,15 @@ typedef struct {
     int         require_mtls;  /* 1 = require client cert (default when !plain) */
     int16_t     identity_slot; /* Bind param slot for router_id */
     int         quiet;         /* less stderr logging */
+
+    /* Optional identity-grouped backend pool */
+    const char *backend_host;  /* NULL = no pool (local stub only) */
+    uint16_t    backend_port;  /* default 5432 */
+    const char *backend_user;
+    const char *backend_password;
+    const char *backend_database;
+    int         backend_use_group_as_user;
+    size_t      backend_pool_size;
 } pqproxy_config_t;
 
 void pqproxy_config_defaults(pqproxy_config_t *cfg);
