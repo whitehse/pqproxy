@@ -25,6 +25,8 @@ static void usage(const char *argv0)
             "  --no-lazy-group      do not open backends on demand for new groups\n"
             "  --ktls-prefer        prefer TLS1.2 AES-GCM for kTLS (default)\n"
             "  --no-ktls-prefer     allow TLS1.3 (may disable kTLS offload)\n"
+            "  --maintain-ms N      backend re-warm interval (default 5000; 0=off)\n"
+            "  --metrics-ms N       metrics log interval (default 30000; 0=off)\n"
             "  --quiet              less logging\n"
             "  -h, --help           this help\n",
             argv0);
@@ -153,6 +155,14 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "--no-ktls-prefer") == 0) {
             cfg.prefer_tls12_ktls = 0;
+            continue;
+        }
+        if (strcmp(argv[i], "--maintain-ms") == 0 && i + 1 < argc) {
+            cfg.maintain_interval_ms = atoi(argv[++i]);
+            continue;
+        }
+        if (strcmp(argv[i], "--metrics-ms") == 0 && i + 1 < argc) {
+            cfg.metrics_log_interval_ms = atoi(argv[++i]);
             continue;
         }
         fprintf(stderr, "unknown argument: %s\n", argv[i]);

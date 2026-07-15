@@ -10,6 +10,7 @@
 #define _GNU_SOURCE
 #include "backend_pool.h"
 #include "scram_client.h"
+#include "metrics_internal.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -518,6 +519,10 @@ int pqproxy_backend_pool_maintain(pqproxy_backend_pool_t *pool)
             }
         }
     }
+    if (n > 0) {
+        pqproxy_metrics_inc_reconnects((unsigned)n);
+    }
+    pqproxy_metrics_inc_maintain((unsigned)n);
     return n;
 }
 
@@ -1094,7 +1099,9 @@ void pqproxy_backend_async_finish(pqproxy_backend_pool_t *pool,
         }
         /* Eager reconnect so next checkout can succeed */
         if (pool && pool->cfg.auto_reconnect && conn->login_user[0]) {
-            (void)pqproxy_backend_reconnect(pool, conn);
+            if (pqproxy_backend_reconnect(pool, conn) == 0) {
+                pqproxy_metrics_inc_reconnects(1);
+            }
             conn->busy = 0; /* reconnect leaves busy as was; force free */
         }
     }

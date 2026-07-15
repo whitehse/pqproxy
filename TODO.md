@@ -57,3 +57,11 @@ Further work to explore. Ordered roughly by dependency.
 - [ ] pique: mid-pipeline error helpers
 - [ ] pique: zero-copy Bind rewrite
 - [ ] bonsai_pki: cert identity helpers for mTLS
+
+## Ops / observability
+
+- [x] Periodic pool maintain via io_uring wait timeout (`--maintain-ms`)
+- [x] Process metrics counters + log line (`--metrics-ms`)
+- [x] RLS/inject integration against ephemeral Postgres (`rls_integration`)
+- [ ] Prometheus/exposition endpoint (optional)
+- [ ] Dashboard examples

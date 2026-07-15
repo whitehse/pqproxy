@@ -4,6 +4,7 @@
  */
 
 #include "pqproxy_internal.h"
+#include "metrics_internal.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -17,6 +18,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <time.h>
 
 #include <liburing.h>
 #include <openssl/ssl.h>
@@ -96,6 +98,7 @@ typedef struct {
     int             be_recv_pending;
     int             got_execute;
     int             got_sync;
+    uint64_t        be_start_ns; /* mono ns when pipeline started */
     uint8_t         be_resp[PQPROXY_IO_BUF];
     size_t          be_resp_len;
     uint8_t         be_recv_buf[PQPROXY_IO_BUF];
@@ -121,7 +124,65 @@ typedef struct {
     struct sockaddr_storage client_addr;
     socklen_t               client_addr_len;
     volatile sig_atomic_t   stop;
+    uint64_t                last_maintain_ms;
+    uint64_t                last_metrics_ms;
 } server_t;
+
+static uint64_t mono_ms(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+static uint64_t mono_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static size_t count_active_frontends(const server_t *srv)
+{
+    int i;
+    size_t n = 0;
+    for (i = 0; i < PQPROXY_MAX_CONNS; i++) {
+        if (srv->conns[i].state != CS_FREE) {
+            n++;
+        }
+    }
+    return n;
+}
+
+static void server_tick(server_t *srv)
+{
+    uint64_t now = mono_ms();
+    int interval = srv->cfg->maintain_interval_ms;
+    int mlog = srv->cfg->metrics_log_interval_ms;
+
+    if (srv->pool && interval > 0 &&
+        (now - srv->last_maintain_ms) >= (uint64_t)interval) {
+        int n = pqproxy_backend_pool_maintain(srv->pool);
+        srv->last_maintain_ms = now;
+        if (n > 0 && !srv->cfg->quiet) {
+            fprintf(stderr, "pqproxy: maintain rewarmed %d backend(s)\n", n);
+        }
+    }
+    if (mlog > 0 && (now - srv->last_metrics_ms) >= (uint64_t)mlog) {
+        pqproxy_metrics_t m;
+        char line[512];
+        size_t live = srv->pool ? pqproxy_backend_pool_live_count(srv->pool) : 0;
+        pqproxy_metrics_set_gauges(live, count_active_frontends(srv));
+        pqproxy_metrics_get(&m);
+        pqproxy_metrics_format(&m, line, sizeof(line));
+        fprintf(stderr, "%s\n", line);
+        srv->last_metrics_ms = now;
+    }
+}
 
 static server_t *g_server;
 
@@ -242,7 +303,9 @@ static void close_conn(server_t *srv, conn_t *c)
     c->send_pending = c->recv_pending = c->poll_pending = 0;
     c->be_send_pending = c->be_recv_pending = 0;
     c->be_wait = BE_IDLE;
+    c->be_start_ns = 0;
     feq_clear_all(c);
+    pqproxy_metrics_inc_closes();
     (void)srv;
 }
 
@@ -360,11 +423,14 @@ static void feq_clear_all(conn_t *c)
 static int feq_push(conn_t *c, const feq_item_t *item)
 {
     if (!c || !item || c->fe_q_count >= FE_Q_MAX) {
+        pqproxy_metrics_inc_fe_q_full();
         return -1;
     }
     c->fe_q[c->fe_q_tail] = *item; /* params ownership transferred */
     c->fe_q_tail = (c->fe_q_tail + 1) % FE_Q_MAX;
     c->fe_q_count++;
+    pqproxy_metrics_inc_fe_q_enq();
+    pqproxy_metrics_note_fe_q_depth(c->fe_q_count);
     return 0;
 }
 
@@ -459,6 +525,11 @@ static int submit_be_recv(server_t *srv, conn_t *c);
 
 static int backend_async_complete(server_t *srv, conn_t *c)
 {
+    if (c->be_start_ns) {
+        pqproxy_metrics_note_backend_wait_ns(mono_ns() - c->be_start_ns);
+        c->be_start_ns = 0;
+    }
+    pqproxy_metrics_inc_be_ok();
     if (pqwire_send_bind_complete(c->frontend) != 0) {
         return -1;
     }
@@ -486,6 +557,11 @@ static int backend_async_complete(server_t *srv, conn_t *c)
 
 static int backend_async_fail(server_t *srv, conn_t *c)
 {
+    if (c->be_start_ns) {
+        pqproxy_metrics_note_backend_wait_ns(mono_ns() - c->be_start_ns);
+        c->be_start_ns = 0;
+    }
+    pqproxy_metrics_inc_be_fail();
     if (c->be) {
         pqproxy_backend_async_finish(srv->pool, c->be, 1);
         c->be = NULL;
@@ -584,6 +660,7 @@ static int start_async_bind_from_event(server_t *srv, conn_t *c, const pq_bind_t
     }
     c->be = be;
     c->be_resp_len = 0;
+    c->be_start_ns = mono_ns();
     if (submit_be_send(srv, c) != 0) {
         return backend_async_fail(srv, c);
     }
@@ -636,6 +713,7 @@ static int start_async_bind_from_queue(server_t *srv, conn_t *c, feq_item_t *it)
     c->be = be;
     c->be_resp_len = 0;
     c->got_execute = c->got_sync = 0;
+    c->be_start_ns = mono_ns();
     (void)lengths;
     (void)values;
     if (submit_be_send(srv, c) != 0) {
@@ -1029,6 +1107,7 @@ static int accept_one(server_t *srv, int fd)
         close(fd);
         return 0;
     }
+    pqproxy_metrics_inc_accepts();
     c->fd = fd;
     (void)set_nonblock(fd);
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
@@ -1104,6 +1183,8 @@ void pqproxy_config_defaults(pqproxy_config_t *cfg)
     cfg->backend_pool_size = 4;
     cfg->backend_lazy_group = 1;
     cfg->prefer_tls12_ktls = 1;
+    cfg->maintain_interval_ms = 5000;
+    cfg->metrics_log_interval_ms = 30000;
 }
 
 int pqproxy_run(const pqproxy_config_t *cfg)
@@ -1204,8 +1285,33 @@ int pqproxy_run(const pqproxy_config_t *cfg)
             srv->pool ? "+backend" : "",
             srv->async_backend ? "/async" : "");
 
+    srv->last_maintain_ms = mono_ms();
+    srv->last_metrics_ms = srv->last_maintain_ms;
+
     while (!srv->stop) {
-        rc = io_uring_wait_cqe(&srv->ring, &cqe);
+        {
+            /* Wake periodically for maintain + metrics even without I/O */
+            int wait_ms = 1000;
+            struct __kernel_timespec ts;
+            if (srv->cfg->maintain_interval_ms > 0 &&
+                srv->cfg->maintain_interval_ms < wait_ms) {
+                wait_ms = srv->cfg->maintain_interval_ms;
+            }
+            if (srv->cfg->metrics_log_interval_ms > 0 &&
+                srv->cfg->metrics_log_interval_ms < wait_ms) {
+                wait_ms = srv->cfg->metrics_log_interval_ms;
+            }
+            if (wait_ms < 100) {
+                wait_ms = 100;
+            }
+            ts.tv_sec = wait_ms / 1000;
+            ts.tv_nsec = (long)(wait_ms % 1000) * 1000000L;
+            rc = io_uring_wait_cqe_timeout(&srv->ring, &cqe, &ts);
+        }
+        if (rc == -ETIME || rc == -EAGAIN) {
+            server_tick(srv);
+            continue;
+        }
         if (rc < 0) {
             if (rc == -EINTR) {
                 continue;
@@ -1213,6 +1319,7 @@ int pqproxy_run(const pqproxy_config_t *cfg)
             fprintf(stderr, "pqproxy: wait_cqe: %s\n", strerror(-rc));
             break;
         }
+        server_tick(srv);
 
         {
             int op, slot;

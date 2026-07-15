@@ -32,6 +32,7 @@ add_library(pqproxy_core STATIC
     src/ktls.c
     src/scram_client.c
     src/backend_pool.c
+    src/metrics.c
     src/iouring_loop.c
 )
 target_include_directories(pqproxy_core PUBLIC
@@ -79,3 +80,13 @@ set_tests_properties(scram_live_pg PROPERTIES
 add_executable(test_reconnect tests/test_reconnect.c)
 target_link_libraries(test_reconnect PRIVATE pqproxy_core pthread)
 add_test(NAME backend_reconnect COMMAND test_reconnect)
+
+add_executable(test_metrics tests/test_metrics.c)
+target_link_libraries(test_metrics PRIVATE pqproxy_core)
+add_test(NAME metrics COMMAND test_metrics)
+
+add_executable(test_rls_proxy tests/test_rls_proxy.c)
+target_link_libraries(test_rls_proxy PRIVATE pqproxy_core)
+add_test(NAME rls_integration
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_rls_integration.sh)
+set_tests_properties(rls_integration PROPERTIES TIMEOUT 90)

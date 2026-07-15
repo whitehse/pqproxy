@@ -95,15 +95,43 @@ typedef struct {
     int         backend_lazy_group;  /* default 1 */
     size_t      backend_pool_size;
     int         prefer_tls12_ktls;   /* prefer TLS1.2 AES-GCM for kTLS (default 1) */
+    int         maintain_interval_ms; /* pool re-warm tick; 0=off, default 5000 */
+    int         metrics_log_interval_ms; /* stderr metrics; 0=off, default 30000 */
 } pqproxy_config_t;
 
 void pqproxy_config_defaults(pqproxy_config_t *cfg);
 
 /**
+ * Runtime metrics (process-wide; updated by the server loop / pool).
+ * Snapshot with pqproxy_metrics_get(); all fields are monotonic counters
+ * except high-water marks and gauges.
+ */
+typedef struct {
+    uint64_t accepts;
+    uint64_t frontend_closes;
+    uint64_t backend_pipelines_ok;
+    uint64_t backend_pipelines_fail;
+    uint64_t fe_queue_enqueued;
+    uint64_t fe_queue_full;
+    uint64_t fe_queue_high_water;   /* max observed queue depth */
+    uint64_t reconnects;            /* successful re-warms */
+    uint64_t maintain_ticks;
+    uint64_t maintain_rewarmed;
+    uint64_t backend_wait_ns_total; /* sum of pipeline wait times */
+    uint64_t backend_wait_samples;
+    uint64_t backend_wait_ns_max;
+    size_t   live_backends;         /* gauge: filled on snapshot */
+    size_t   active_frontends;      /* gauge */
+} pqproxy_metrics_t;
+
+void pqproxy_metrics_get(pqproxy_metrics_t *out);
+/** Format one-line metrics for logs. Returns out. */
+char *pqproxy_metrics_format(const pqproxy_metrics_t *m, char *out, size_t out_len);
+
+/**
  * Run the proxy accept loop (blocks until fatal error or signal).
- * io_uring for accept/recv/send; OpenSSL memory-BIO mTLS when !plain.
- * Frontend pqwire SERVER role drives Parse intercept locally; backend
- * pool is not yet connected (rewrite queues for future pool).
+ * io_uring for accept/recv/send; OpenSSL mTLS when !plain.
+ * Periodic pool maintain + metrics logging per config intervals.
  *
  * Returns 0 on clean shutdown, non-zero on fatal error.
  */
