@@ -27,6 +27,9 @@ static void usage(const char *argv0)
             "  --no-ktls-prefer     allow TLS1.3 (may disable kTLS offload)\n"
             "  --maintain-ms N      backend re-warm interval (default 5000; 0=off)\n"
             "  --metrics-ms N       metrics log interval (default 30000; 0=off)\n"
+            "  --metrics-http HOST:PORT  Prometheus scrape (default 127.0.0.1:9108)\n"
+            "  --metrics-http-port N     metrics HTTP port only (host stays default)\n"
+            "  --no-metrics-http    disable Prometheus /metrics HTTP\n"
             "  --quiet              less logging\n"
             "  -h, --help           this help\n",
             argv0);
@@ -163,6 +166,37 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "--metrics-ms") == 0 && i + 1 < argc) {
             cfg.metrics_log_interval_ms = atoi(argv[++i]);
+            continue;
+        }
+        if (strcmp(argv[i], "--no-metrics-http") == 0) {
+            cfg.metrics_http_port = 0;
+            continue;
+        }
+        if (strcmp(argv[i], "--metrics-http-port") == 0 && i + 1 < argc) {
+            int p = atoi(argv[++i]);
+            if (p < 0 || p > 65535) {
+                fprintf(stderr, "invalid --metrics-http-port\n");
+                return 2;
+            }
+            cfg.metrics_http_port = (uint16_t)p;
+            continue;
+        }
+        if (strcmp(argv[i], "--metrics-http") == 0 && i + 1 < argc) {
+            char *s = argv[++i];
+            char *colon = strrchr(s, ':');
+            if (colon && colon != s) {
+                *colon = '\0';
+                cfg.metrics_http_host = s;
+                cfg.metrics_http_port = (uint16_t)atoi(colon + 1);
+            } else {
+                /* bare host or bare port */
+                int p = atoi(s);
+                if (p > 0 && p <= 65535 && s[0] >= '0' && s[0] <= '9') {
+                    cfg.metrics_http_port = (uint16_t)p;
+                } else {
+                    cfg.metrics_http_host = s;
+                }
+            }
             continue;
         }
         fprintf(stderr, "unknown argument: %s\n", argv[i]);

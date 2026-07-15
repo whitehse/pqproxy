@@ -5,6 +5,7 @@
 
 #include "pqproxy_internal.h"
 #include "metrics_internal.h"
+#include "metrics_http.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -1185,6 +1186,8 @@ void pqproxy_config_defaults(pqproxy_config_t *cfg)
     cfg->prefer_tls12_ktls = 1;
     cfg->maintain_interval_ms = 5000;
     cfg->metrics_log_interval_ms = 30000;
+    cfg->metrics_http_host = "127.0.0.1";
+    cfg->metrics_http_port = 9108;
 }
 
 int pqproxy_run(const pqproxy_config_t *cfg)
@@ -1284,6 +1287,13 @@ int pqproxy_run(const pqproxy_config_t *cfg)
             cfg->plain ? "plain" : (cfg->require_mtls ? "mTLS" : "TLS"),
             srv->pool ? "+backend" : "",
             srv->async_backend ? "/async" : "");
+
+    if (cfg->metrics_http_port > 0) {
+        if (pqproxy_metrics_http_start(cfg->metrics_http_host, cfg->metrics_http_port) != 0 &&
+            !cfg->quiet) {
+            fprintf(stderr, "pqproxy: metrics HTTP failed to start (continuing)\n");
+        }
+    }
 
     srv->last_maintain_ms = mono_ms();
     srv->last_metrics_ms = srv->last_maintain_ms;
@@ -1406,6 +1416,7 @@ int pqproxy_run(const pqproxy_config_t *cfg)
         io_uring_submit(&srv->ring);
     }
 
+    pqproxy_metrics_http_stop();
     for (i = 0; i < PQPROXY_MAX_CONNS; i++) {
         close_conn(srv, &srv->conns[i]);
     }

@@ -97,6 +97,8 @@ typedef struct {
     int         prefer_tls12_ktls;   /* prefer TLS1.2 AES-GCM for kTLS (default 1) */
     int         maintain_interval_ms; /* pool re-warm tick; 0=off, default 5000 */
     int         metrics_log_interval_ms; /* stderr metrics; 0=off, default 30000 */
+    const char *metrics_http_host;  /* default 127.0.0.1; NULL with port 0 = off */
+    uint16_t    metrics_http_port;  /* 0 = disable HTTP /metrics (default 9108) */
 } pqproxy_config_t;
 
 void pqproxy_config_defaults(pqproxy_config_t *cfg);

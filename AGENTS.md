@@ -38,10 +38,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md). Domain intent and library boundaries are
 
 ## Definition of done
 
-- [ ] Builds with `-Wall -Wextra -Wpedantic -Werror`
-- [ ] Unit/dialectic tests for rewrite engine without a real database
-- [ ] Integration path documented (mTLS fixture + local Postgres)
-- [ ] TODO.md items updated when architecture changes
+- [x] Builds with `-Wall -Wextra -Wpedantic -Werror`
+- [x] Unit/dialectic tests for rewrite engine without a real database
+- [x] Integration path documented (mTLS fixture + local Postgres; `run_e2e_proxy.sh`)
+- [x] TODO.md items updated when architecture changes
 
 ## Related libraries
 

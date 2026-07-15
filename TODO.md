@@ -47,10 +47,10 @@ Further work to explore. Ordered roughly by dependency.
 
 ## Hardening / ops
 
-- [ ] Load test harness (many concurrent fake CPE clients)
-- [ ] Metrics: active frontends, pool wait, inject failures
+- [x] Load test harness (many concurrent fake CPE clients) — `tests/load_harness.c`
+- [x] Metrics: active frontends, pool wait, inject failures (counters + gauges)
 - [ ] systemd unit + example configs
-- [ ] Integration test against real Postgres RLS policies
+- [x] Integration test against real Postgres RLS policies (`rls_integration`, `e2e_proxy_rls`)
 
 ## Library follow-ups (track in pique/TODO.md too)
 
@@ -63,5 +63,6 @@ Further work to explore. Ordered roughly by dependency.
 - [x] Periodic pool maintain via io_uring wait timeout (`--maintain-ms`)
 - [x] Process metrics counters + log line (`--metrics-ms`)
 - [x] RLS/inject integration against ephemeral Postgres (`rls_integration`)
-- [ ] Prometheus/exposition endpoint (optional)
+- [x] Prometheus /metrics HTTP (`metrics_http.c`, `--metrics-http`, default `:9108`)
+- [x] Full TCP e2e: pqproxy + backend + load + metrics + mTLS smoke (`run_e2e_proxy.sh`)
 - [ ] Dashboard examples

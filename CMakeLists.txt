@@ -33,6 +33,7 @@ add_library(pqproxy_core STATIC
     src/scram_client.c
     src/backend_pool.c
     src/metrics.c
+    src/metrics_http.c
     src/iouring_loop.c
 )
 target_include_directories(pqproxy_core PUBLIC
@@ -46,6 +47,7 @@ target_link_libraries(pqproxy_core PUBLIC
     OpenSSL::SSL
     OpenSSL::Crypto
     ${URING_LIBRARIES}
+    pthread
 )
 
 add_executable(pqproxy src/main.c)
@@ -85,8 +87,22 @@ add_executable(test_metrics tests/test_metrics.c)
 target_link_libraries(test_metrics PRIVATE pqproxy_core)
 add_test(NAME metrics COMMAND test_metrics)
 
+add_executable(test_metrics_http tests/test_metrics_http.c)
+target_link_libraries(test_metrics_http PRIVATE pqproxy_core)
+add_test(NAME metrics_http COMMAND test_metrics_http)
+
+add_executable(load_harness tests/load_harness.c)
+target_link_libraries(load_harness PRIVATE pqproxy_core)
+
 add_executable(test_rls_proxy tests/test_rls_proxy.c)
 target_link_libraries(test_rls_proxy PRIVATE pqproxy_core)
 add_test(NAME rls_integration
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_rls_integration.sh)
 set_tests_properties(rls_integration PROPERTIES TIMEOUT 90)
+
+# Full TCP e2e: ephemeral Postgres + pqproxy (+ optional mTLS) + load + /metrics
+add_test(NAME e2e_proxy_rls
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_e2e_proxy.sh)
+set_tests_properties(e2e_proxy_rls PROPERTIES
+                     TIMEOUT 120
+                     ENVIRONMENT "PQPROXY_SKIP_LIVE_PG=$ENV{PQPROXY_SKIP_LIVE_PG}")
