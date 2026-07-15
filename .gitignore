@@ -4,3 +4,4 @@ build/
 *.so
 .cache/
 compile_commands.json
+certs/
