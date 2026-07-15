@@ -13,15 +13,16 @@ per-client backend connections, by:
 
 ```
 src/
-  main.c              — process entry, config load
-  iouring_loop.c      — io_uring event loop (app owns syscalls)
-  tls_ktls.c          — OpenSSL handshake → SOL_TLS handoff
-  frontend_conn.c     — per-client state; pqwire SERVER role
-  backend_pool.c      — identity-grouped backend connections; pqwire CLIENT role
+  main.c              — CLI (--listen, --cert/--key/--ca, --plain)
+  iouring_loop.c      — io_uring accept/recv/send + conn pool + pqwire frontend
+  tls_mtls.c          — OpenSSL SSL_CTX, memory-BIO mTLS, peer cert extract
   rewrite_engine.c    — Parse cache, Bind inject, unnamed pipeline
-  identity.c          — cert SAN/CN → router_id + group mapping
+  identity.c          — subject/X509 → router_id + group
 include/
-  pqproxy.h           — public app types (not a library ABI)
+  pqproxy.h           — public app types + pqproxy_run()
+  pqproxy_internal.h  — TLS helpers
+scripts/
+  gen_dev_certs.sh    — local mTLS PKI
 ```
 
 ## Data flow
