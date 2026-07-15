@@ -31,6 +31,8 @@ Further work to explore. Ordered roughly by dependency.
 - [x] Full SCRAM-SHA-256 warm-up (`scram_client.c`, OpenSSL PBKDF2/HMAC)
 - [x] Per-group login (`--backend-group-login`, `--backend-groups`, lazy open)
 - [ ] Fair scheduling when many frontends share one backend
+- [x] Async backend I/O on io_uring (OP_BE_SEND/RECV, nonblock pool)
+- [x] Live SCRAM against ephemeral Postgres (`scram_live_pg` / run_live_scram_test.sh)
 - [ ] Health check / reconnect on backend ErrorResponse / EOF
 
 ## Rewrite engine

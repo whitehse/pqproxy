@@ -69,12 +69,60 @@ int pqproxy_backend_flush_pipeline(pqproxy_backend_conn_t *conn,
 /**
  * High-level: inject Bind → unnamed pipeline on a checked-out backend,
  * run flush, return filtered response bytes for the frontend.
+ * (Blocking I/O — used by tests and as fallback.)
  */
 int pqproxy_backend_exec_bind(pqproxy_backend_pool_t *pool,
                               const pqproxy_stmt_cache_t *cache,
                               const pq_bind_t *bind,
                               const pqproxy_identity_t *id,
                               uint8_t *out, size_t out_cap, size_t *out_len);
+
+/* ── Async / io_uring-friendly pipeline ──────────────────────────────── */
+
+/**
+ * Checkout backend, inject bind pipeline into wire output, fill internal
+ * send buffer. Does not perform socket I/O.
+ * Returns 0 and *conn_out on success.
+ */
+int pqproxy_backend_async_begin(pqproxy_backend_pool_t *pool,
+                                const pqproxy_stmt_cache_t *cache,
+                                const pq_bind_t *bind,
+                                const pqproxy_identity_t *id,
+                                pqproxy_backend_conn_t **conn_out);
+
+/** Remaining bytes to send to backend socket. */
+size_t pqproxy_backend_async_send_pending(const pqproxy_backend_conn_t *conn);
+
+/** Pointer to next send chunk. */
+const uint8_t *pqproxy_backend_async_send_ptr(const pqproxy_backend_conn_t *conn,
+                                              size_t *len_out);
+
+/** Advance send cursor after a successful write of n bytes. */
+void pqproxy_backend_async_send_advance(pqproxy_backend_conn_t *conn, size_t n);
+
+/**
+ * Feed one recv buffer of backend data. Appends filtered messages to out
+ * (caller-owned buffer). Sets *complete=1 when ReadyForQuery seen.
+ * Returns 0 on success, -1 on protocol/hard error.
+ */
+int pqproxy_backend_async_on_recv(pqproxy_backend_conn_t *conn,
+                                  const uint8_t *data, size_t len,
+                                  uint8_t *out, size_t out_cap, size_t *out_len,
+                                  int *complete);
+
+/** Backend TCP fd (for io_uring registration). */
+int pqproxy_backend_fd(const pqproxy_backend_conn_t *conn);
+
+/** Slot index (stable for user_data packing). */
+int pqproxy_backend_slot(const pqproxy_backend_conn_t *conn);
+
+/** Finish async op: checkin (call after complete or error). */
+void pqproxy_backend_async_finish(pqproxy_backend_pool_t *pool,
+                                  pqproxy_backend_conn_t *conn,
+                                  int failed);
+
+/** Set non-blocking mode on all live backends (after warm-up). */
+int pqproxy_backend_pool_set_nonblock(pqproxy_backend_pool_t *pool);
 
 #ifdef __cplusplus
 }

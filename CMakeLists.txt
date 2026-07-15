@@ -66,3 +66,12 @@ add_test(NAME backend_pool COMMAND test_backend_pool)
 add_executable(test_scram_client tests/test_scram_client.c)
 target_link_libraries(test_scram_client PRIVATE pqproxy_core)
 add_test(NAME scram_client COMMAND test_scram_client)
+
+add_executable(test_scram_live tests/test_scram_live.c)
+target_link_libraries(test_scram_live PRIVATE pqproxy_core)
+# Optional live Postgres: scripts/run_live_scram_test.sh (skips if no initdb)
+add_test(NAME scram_live_pg
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_live_scram_test.sh)
+set_tests_properties(scram_live_pg PROPERTIES
+                     TIMEOUT 60
+                     ENVIRONMENT "PQPROXY_SKIP_LIVE_PG=$ENV{PQPROXY_SKIP_LIVE_PG}")

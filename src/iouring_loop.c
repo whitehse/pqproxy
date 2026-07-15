@@ -23,10 +23,12 @@
 #include <openssl/err.h>
 
 enum {
-    OP_ACCEPT = 1,
-    OP_RECV   = 2, /* plain TCP */
-    OP_SEND   = 3, /* plain TCP */
-    OP_POLL   = 4  /* TLS: POLLIN / POLLOUT readiness */
+    OP_ACCEPT  = 1,
+    OP_RECV    = 2, /* frontend plain TCP */
+    OP_SEND    = 3, /* frontend plain TCP */
+    OP_POLL    = 4, /* frontend TLS readiness */
+    OP_BE_SEND = 5, /* backend write (slot = frontend slot) */
+    OP_BE_RECV = 6  /* backend read  (slot = frontend slot) */
 };
 
 typedef enum {
@@ -35,6 +37,12 @@ typedef enum {
     CS_ACTIVE,
     CS_CLOSING
 } conn_state_t;
+
+typedef enum {
+    BE_IDLE = 0,
+    BE_SENDING,
+    BE_READING
+} be_wait_t;
 
 typedef struct {
     int             fd;
@@ -48,17 +56,24 @@ typedef struct {
 
     uint8_t         recv_buf[PQPROXY_IO_BUF];
     uint8_t         plain_buf[PQPROXY_IO_BUF];
-    uint8_t         send_buf[PQPROXY_IO_BUF]; /* plain: ciphertext N/A; plain TCP only */
+    uint8_t         send_buf[PQPROXY_IO_BUF];
     size_t          send_len;
     size_t          send_off;
     int             send_pending;
     int             recv_pending;
     int             poll_pending;
-    int             want_poll_out; /* TLS needs POLLOUT */
+    int             want_poll_out;
 
-    /* Pending backend response to write to frontend after Sync */
+    /* Async backend pipeline */
+    pqproxy_backend_conn_t *be;
+    be_wait_t       be_wait;
+    int             be_send_pending;
+    int             be_recv_pending;
+    int             got_execute;
+    int             got_sync;
     uint8_t         be_resp[PQPROXY_IO_BUF];
     size_t          be_resp_len;
+    uint8_t         be_recv_buf[PQPROXY_IO_BUF];
 
     int             slot;
 } conn_t;
@@ -67,6 +82,7 @@ typedef struct {
     const pqproxy_config_t *cfg;
     SSL_CTX                *tls_ctx;
     pqproxy_backend_pool_t *pool;
+    int                     async_backend; /* 1 = io_uring backend path */
     struct io_uring         ring;
     int                     listen_fd;
     conn_t                  conns[PQPROXY_MAX_CONNS];
@@ -170,6 +186,10 @@ static void close_conn(server_t *srv, conn_t *c)
     if (!c || c->state == CS_FREE) {
         return;
     }
+    if (c->be && srv->pool) {
+        pqproxy_backend_async_finish(srv->pool, c->be, 1);
+        c->be = NULL;
+    }
     if (c->ssl) {
         SSL_free(c->ssl);
         c->ssl = NULL;
@@ -184,6 +204,8 @@ static void close_conn(server_t *srv, conn_t *c)
     }
     c->state = CS_FREE;
     c->send_pending = c->recv_pending = c->poll_pending = 0;
+    c->be_send_pending = c->be_recv_pending = 0;
+    c->be_wait = BE_IDLE;
     (void)srv;
 }
 
@@ -275,11 +297,147 @@ static int queue_plain_send(server_t *srv, conn_t *c, const uint8_t *data, size_
     return submit_send(srv, c);
 }
 
+
+static int drain_frontend_out(server_t *srv, conn_t *c)
+{
+    uint8_t out[PQPROXY_IO_BUF];
+    size_t n;
+    for (;;) {
+        n = pqwire_get_output(c->frontend, out, sizeof(out));
+        if (n == 0) {
+            break;
+        }
+        if (queue_plain_send(srv, c, out, n) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int submit_be_send(server_t *srv, conn_t *c);
+static int submit_be_recv(server_t *srv, conn_t *c);
+
+static int backend_async_complete(server_t *srv, conn_t *c)
+{
+    if (pqwire_send_bind_complete(c->frontend) != 0) {
+        return -1;
+    }
+    if (c->got_sync && c->be_resp_len > 0) {
+        if (queue_plain_send(srv, c, c->be_resp, c->be_resp_len) != 0) {
+            return -1;
+        }
+        c->be_resp_len = 0;
+    } else if (c->got_sync && c->be_resp_len == 0) {
+        if (pqwire_send_ready_for_query(c->frontend) != 0) {
+            return -1;
+        }
+    }
+    if (drain_frontend_out(srv, c) != 0) {
+        return -1;
+    }
+    if (c->be) {
+        pqproxy_backend_async_finish(srv->pool, c->be, 0);
+        c->be = NULL;
+    }
+    c->be_wait = BE_IDLE;
+    c->got_execute = c->got_sync = 0;
+    return 0;
+}
+
+static int backend_async_fail(server_t *srv, conn_t *c)
+{
+    if (c->be) {
+        pqproxy_backend_async_finish(srv->pool, c->be, 1);
+        c->be = NULL;
+    }
+    c->be_wait = BE_IDLE;
+    c->be_resp_len = 0;
+    (void)pqwire_send_error_response(c->frontend, "ERROR", "08006",
+                                     "backend pipeline failed");
+    (void)pqwire_send_ready_for_query(c->frontend);
+    return drain_frontend_out(srv, c);
+}
+
+static int submit_be_send(server_t *srv, conn_t *c)
+{
+    struct io_uring_sqe *sqe;
+    const uint8_t *ptr;
+    size_t n;
+    int bfd;
+
+    if (!c->be || c->be_send_pending) {
+        return 0;
+    }
+    ptr = pqproxy_backend_async_send_ptr(c->be, &n);
+    if (!ptr || n == 0) {
+        c->be_wait = BE_READING;
+        return submit_be_recv(srv, c);
+    }
+    bfd = pqproxy_backend_fd(c->be);
+    sqe = io_uring_get_sqe(&srv->ring);
+    if (!sqe) {
+        return -1;
+    }
+    io_uring_prep_send(sqe, bfd, ptr, n, 0);
+    io_uring_sqe_set_data64(sqe, pack_ud(OP_BE_SEND, c->slot));
+    c->be_send_pending = 1;
+    c->be_wait = BE_SENDING;
+    return 0;
+}
+
+static int submit_be_recv(server_t *srv, conn_t *c)
+{
+    struct io_uring_sqe *sqe;
+    int bfd;
+    if (!c->be || c->be_recv_pending) {
+        return 0;
+    }
+    bfd = pqproxy_backend_fd(c->be);
+    sqe = io_uring_get_sqe(&srv->ring);
+    if (!sqe) {
+        return -1;
+    }
+    io_uring_prep_recv(sqe, bfd, c->be_recv_buf, sizeof(c->be_recv_buf), 0);
+    io_uring_sqe_set_data64(sqe, pack_ud(OP_BE_RECV, c->slot));
+    c->be_recv_pending = 1;
+    c->be_wait = BE_READING;
+    return 0;
+}
+
+static int on_be_send_cqe(server_t *srv, conn_t *c, int res)
+{
+    c->be_send_pending = 0;
+    if (res < 0) {
+        if (res == -EAGAIN || res == -EWOULDBLOCK) {
+            return submit_be_send(srv, c);
+        }
+        return backend_async_fail(srv, c);
+    }
+    pqproxy_backend_async_send_advance(c->be, (size_t)res);
+    return submit_be_send(srv, c);
+}
+
+static int on_be_recv_cqe(server_t *srv, conn_t *c, int res)
+{
+    int complete = 0;
+    c->be_recv_pending = 0;
+    if (res <= 0) {
+        return backend_async_fail(srv, c);
+    }
+    if (pqproxy_backend_async_on_recv(c->be, c->be_recv_buf, (size_t)res,
+                                      c->be_resp, sizeof(c->be_resp),
+                                      &c->be_resp_len, &complete) != 0) {
+        return backend_async_fail(srv, c);
+    }
+    if (complete) {
+        return backend_async_complete(srv, c);
+    }
+    return submit_be_recv(srv, c);
+}
+
 static int process_frontend(server_t *srv, conn_t *c)
 {
     protocol_event_t ev;
-    uint8_t out[PQPROXY_IO_BUF];
-    size_t n;
 
     while (pqwire_next_event(c->frontend, &ev) == 1) {
         switch (ev.type) {
@@ -310,6 +468,23 @@ static int process_frontend(server_t *srv, conn_t *c)
 
         case PQ_EVENT_BIND:
             c->be_resp_len = 0;
+            c->got_execute = c->got_sync = 0;
+            if (srv->pool && c->identity_ready && srv->async_backend &&
+                c->be_wait == BE_IDLE) {
+                pqproxy_backend_conn_t *be = NULL;
+                if (pqproxy_backend_async_begin(srv->pool, &c->cache,
+                                                &ev.payload.bind, &c->id,
+                                                &be) == 0) {
+                    c->be = be;
+                    if (submit_be_send(srv, c) != 0) {
+                        return backend_async_fail(srv, c);
+                    }
+                    break;
+                }
+                if (!srv->cfg->quiet) {
+                    fprintf(stderr, "pqproxy: async backend begin failed; try sync\n");
+                }
+            }
             if (srv->pool && c->identity_ready) {
                 size_t rlen = 0;
                 if (pqproxy_backend_exec_bind(srv->pool, &c->cache, &ev.payload.bind,
@@ -325,14 +500,16 @@ static int process_frontend(server_t *srv, conn_t *c)
                     fprintf(stderr, "pqproxy: backend bind failed; local stub\n");
                 }
             }
-            /* No pool / failure: local BindComplete only */
             if (pqwire_send_bind_complete(c->frontend) != 0) {
                 return -1;
             }
             break;
 
         case PQ_EVENT_EXECUTE:
-            /* Results come from backend on Sync when pool is used */
+            if (c->be_wait != BE_IDLE) {
+                c->got_execute = 1;
+                break;
+            }
             if (!srv->pool || c->be_resp_len == 0) {
                 if (pqwire_send_command_complete(c->frontend, "SELECT 0") != 0) {
                     return -1;
@@ -341,8 +518,11 @@ static int process_frontend(server_t *srv, conn_t *c)
             break;
 
         case PQ_EVENT_SYNC:
+            if (c->be_wait != BE_IDLE) {
+                c->got_sync = 1;
+                break;
+            }
             if (c->be_resp_len > 0) {
-                /* Forward filtered backend messages (already skip 1/2) */
                 if (queue_plain_send(srv, c, c->be_resp, c->be_resp_len) != 0) {
                     return -1;
                 }
@@ -370,17 +550,9 @@ static int process_frontend(server_t *srv, conn_t *c)
         }
     }
 
-    for (;;) {
-        n = pqwire_get_output(c->frontend, out, sizeof(out));
-        if (n == 0) {
-            break;
-        }
-        if (queue_plain_send(srv, c, out, n) != 0) {
-            return -1;
-        }
-    }
-    return 0;
+    return drain_frontend_out(srv, c);
 }
+
 
 static int feed_plain(server_t *srv, conn_t *c, const uint8_t *data, size_t len)
 {
@@ -666,6 +838,13 @@ int pqproxy_run(const pqproxy_config_t *cfg)
         if (!srv->pool && !cfg->quiet) {
             fprintf(stderr, "pqproxy: backend pool unavailable; rewrite local-only\n");
         }
+        if (srv->pool) {
+            if (pqproxy_backend_pool_set_nonblock(srv->pool) == 0) {
+                srv->async_backend = 1;
+            } else if (!cfg->quiet) {
+                fprintf(stderr, "pqproxy: backend nonblock failed; using sync I/O\n");
+            }
+        }
     }
 
     srv->listen_fd = create_listen_socket(cfg);
@@ -699,11 +878,12 @@ int pqproxy_run(const pqproxy_config_t *cfg)
     }
     io_uring_submit(&srv->ring);
 
-    fprintf(stderr, "pqproxy: listening on %s:%u (%s%s)\n",
+    fprintf(stderr, "pqproxy: listening on %s:%u (%s%s%s)\n",
             cfg->listen_host ? cfg->listen_host : "0.0.0.0",
             (unsigned)cfg->listen_port,
             cfg->plain ? "plain" : (cfg->require_mtls ? "mTLS" : "TLS"),
-            srv->pool ? "+backend" : "");
+            srv->pool ? "+backend" : "",
+            srv->async_backend ? "/async" : "");
 
     while (!srv->stop) {
         rc = io_uring_wait_cqe(&srv->ring, &cqe);
@@ -774,6 +954,24 @@ int pqproxy_run(const pqproxy_config_t *cfg)
                     if (res < 0) {
                         close_conn(srv, c);
                     } else if (on_tls_poll(srv, c, res) != 0) {
+                        close_conn(srv, c);
+                    }
+                }
+            } else if (op == OP_BE_SEND) {
+                conn_t *c = (slot >= 0 && slot < PQPROXY_MAX_CONNS)
+                                ? &srv->conns[slot]
+                                : NULL;
+                if (c && c->state != CS_FREE && c->be) {
+                    if (on_be_send_cqe(srv, c, res) != 0) {
+                        close_conn(srv, c);
+                    }
+                }
+            } else if (op == OP_BE_RECV) {
+                conn_t *c = (slot >= 0 && slot < PQPROXY_MAX_CONNS)
+                                ? &srv->conns[slot]
+                                : NULL;
+                if (c && c->state != CS_FREE && c->be) {
+                    if (on_be_recv_cqe(srv, c, res) != 0) {
                         close_conn(srv, c);
                     }
                 }

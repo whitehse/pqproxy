@@ -33,6 +33,9 @@
 #define MAX_BACKEND_GROUPS   16
 #define MAX_GROUP_NAME       64
 
+#define BE_SEND_CAP  32768
+#define BE_RECV_CAP  16384
+
 struct pqproxy_backend_conn {
     int             fd;
     pqwire_ctx_t   *wire;
@@ -40,6 +43,13 @@ struct pqproxy_backend_conn {
     int             busy;
     int             alive;
     int             slot;
+    /* Async pipeline state */
+    uint8_t         send_buf[BE_SEND_CAP];
+    size_t          send_len;
+    size_t          send_off;
+    uint8_t         recv_acc[BE_RECV_CAP];
+    size_t          recv_acc_len;
+    int             skip_parse_bind;
 };
 
 struct pqproxy_backend_pool {
@@ -735,4 +745,229 @@ int pqproxy_backend_exec_bind(pqproxy_backend_pool_t *pool,
     rc = pqproxy_backend_flush_pipeline(be, out, out_cap, out_len, 1);
     pqproxy_backend_checkin(pool, be);
     return rc;
+}
+
+/* ── Async helpers ───────────────────────────────────────────────────── */
+
+static int be_filter_append(pqproxy_backend_conn_t *conn, const uint8_t *msg,
+                            size_t mlen, uint8_t *out, size_t out_cap,
+                            size_t *out_len, int *saw_rfq)
+{
+    char type;
+    if (!msg || mlen < 5) {
+        return -1;
+    }
+    type = (char)msg[0];
+    (void)pqwire_feed_input(conn->wire, msg, mlen);
+    {
+        protocol_event_t ev;
+        while (pqwire_next_event(conn->wire, &ev) == 1) {
+            if (ev.type == PQ_EVENT_READY_FOR_QUERY && saw_rfq) {
+                *saw_rfq = 1;
+            }
+        }
+    }
+    if (conn->skip_parse_bind && (type == '1' || type == '2')) {
+        return 0;
+    }
+    if (type == 'S' || type == 'N' || type == 'K') {
+        return 0;
+    }
+    if (*out_len + mlen > out_cap) {
+        return -1;
+    }
+    memcpy(out + *out_len, msg, mlen);
+    *out_len += mlen;
+    if (type == 'Z' && saw_rfq) {
+        *saw_rfq = 1;
+    }
+    return 0;
+}
+
+int pqproxy_backend_async_begin(pqproxy_backend_pool_t *pool,
+                                const pqproxy_stmt_cache_t *cache,
+                                const pq_bind_t *bind,
+                                const pqproxy_identity_t *id,
+                                pqproxy_backend_conn_t **conn_out)
+{
+    pqproxy_backend_conn_t *be;
+    uint8_t chunk[4096];
+    size_t n;
+
+    if (!pool || !cache || !bind || !id || !conn_out) {
+        return -1;
+    }
+    *conn_out = NULL;
+    be = pqproxy_backend_checkout(pool, id->group);
+    if (!be) {
+        return -1;
+    }
+    {
+        uint8_t dump[1024];
+        while (pqwire_get_output(be->wire, dump, sizeof(dump)) > 0) {
+        }
+    }
+    be->send_len = be->send_off = 0;
+    be->recv_acc_len = 0;
+    be->skip_parse_bind = 1;
+
+    if (pqproxy_on_bind(be->wire, cache, bind, id) != 0) {
+        pqproxy_backend_checkin(pool, be);
+        return -1;
+    }
+    for (;;) {
+        n = pqwire_get_output(be->wire, chunk, sizeof(chunk));
+        if (n == 0) {
+            break;
+        }
+        if (be->send_len + n > BE_SEND_CAP) {
+            pqproxy_backend_checkin(pool, be);
+            return -1;
+        }
+        memcpy(be->send_buf + be->send_len, chunk, n);
+        be->send_len += n;
+    }
+    if (be->send_len == 0) {
+        pqproxy_backend_checkin(pool, be);
+        return -1;
+    }
+    *conn_out = be;
+    return 0;
+}
+
+size_t pqproxy_backend_async_send_pending(const pqproxy_backend_conn_t *conn)
+{
+    if (!conn || conn->send_off >= conn->send_len) {
+        return 0;
+    }
+    return conn->send_len - conn->send_off;
+}
+
+const uint8_t *pqproxy_backend_async_send_ptr(const pqproxy_backend_conn_t *conn,
+                                              size_t *len_out)
+{
+    if (!conn || !len_out) {
+        return NULL;
+    }
+    if (conn->send_off >= conn->send_len) {
+        *len_out = 0;
+        return NULL;
+    }
+    *len_out = conn->send_len - conn->send_off;
+    return conn->send_buf + conn->send_off;
+}
+
+void pqproxy_backend_async_send_advance(pqproxy_backend_conn_t *conn, size_t n)
+{
+    if (!conn) {
+        return;
+    }
+    conn->send_off += n;
+    if (conn->send_off > conn->send_len) {
+        conn->send_off = conn->send_len;
+    }
+}
+
+int pqproxy_backend_async_on_recv(pqproxy_backend_conn_t *conn,
+                                  const uint8_t *data, size_t len,
+                                  uint8_t *out, size_t out_cap, size_t *out_len,
+                                  int *complete)
+{
+    size_t off;
+    int saw_rfq = 0;
+
+    if (!conn || !data || !out || !out_len || !complete) {
+        return -1;
+    }
+    *complete = 0;
+    if (conn->recv_acc_len + len > BE_RECV_CAP) {
+        return -1;
+    }
+    memcpy(conn->recv_acc + conn->recv_acc_len, data, len);
+    conn->recv_acc_len += len;
+
+    off = 0;
+    while (off + 5 <= conn->recv_acc_len) {
+        uint32_t mlen = ((uint32_t)conn->recv_acc[off + 1] << 24) |
+                        ((uint32_t)conn->recv_acc[off + 2] << 16) |
+                        ((uint32_t)conn->recv_acc[off + 3] << 8) |
+                        (uint32_t)conn->recv_acc[off + 4];
+        size_t total;
+        if (mlen < 4) {
+            return -1;
+        }
+        total = 1u + (size_t)mlen;
+        if (off + total > conn->recv_acc_len) {
+            break;
+        }
+        if (be_filter_append(conn, conn->recv_acc + off, total, out, out_cap,
+                             out_len, &saw_rfq) != 0) {
+            return -1;
+        }
+        off += total;
+        if (saw_rfq) {
+            *complete = 1;
+            break;
+        }
+    }
+    if (off > 0) {
+        memmove(conn->recv_acc, conn->recv_acc + off, conn->recv_acc_len - off);
+        conn->recv_acc_len -= off;
+    }
+    return 0;
+}
+
+int pqproxy_backend_fd(const pqproxy_backend_conn_t *conn)
+{
+    return conn ? conn->fd : -1;
+}
+
+int pqproxy_backend_slot(const pqproxy_backend_conn_t *conn)
+{
+    return conn ? conn->slot : -1;
+}
+
+void pqproxy_backend_async_finish(pqproxy_backend_pool_t *pool,
+                                  pqproxy_backend_conn_t *conn,
+                                  int failed)
+{
+    if (!conn) {
+        return;
+    }
+    if (failed) {
+        conn->alive = 0;
+        if (conn->fd >= 0) {
+            close(conn->fd);
+            conn->fd = -1;
+        }
+        if (conn->wire) {
+            pqwire_destroy(conn->wire);
+            conn->wire = NULL;
+        }
+    }
+    conn->send_len = conn->send_off = 0;
+    conn->recv_acc_len = 0;
+    pqproxy_backend_checkin(pool, conn);
+}
+
+int pqproxy_backend_pool_set_nonblock(pqproxy_backend_pool_t *pool)
+{
+    size_t i;
+    if (!pool) {
+        return -1;
+    }
+    for (i = 0; i < pool->max_conns; i++) {
+        int flags;
+        if (!pool->conns[i].alive || pool->conns[i].fd < 0) {
+            continue;
+        }
+        flags = fcntl(pool->conns[i].fd, F_GETFL, 0);
+        if (flags < 0) {
+            return -1;
+        }
+        if (fcntl(pool->conns[i].fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+            return -1;
+        }
+    }
+    return 0;
 }
