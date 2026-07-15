@@ -34,6 +34,8 @@ int pqproxy_stmt_cache_put(pqproxy_stmt_cache_t *cache, const pq_parse_t *parse,
                            int16_t identity_slot);
 const pqwire_prepared_stmt_t *pqproxy_stmt_cache_get(const pqproxy_stmt_cache_t *cache,
                                                      const char *name);
+/** Remove a statement by name (rehashes open-address table). 0=ok, -1=missing. */
+int pqproxy_stmt_cache_remove(pqproxy_stmt_cache_t *cache, const char *name);
 
 /**
  * Handle a frontend Parse event: cache statement, emit local ParseComplete
@@ -48,6 +50,14 @@ int pqproxy_on_parse(pqwire_ctx_t *frontend, pqproxy_stmt_cache_t *cache,
  */
 int pqproxy_on_bind(pqwire_ctx_t *backend, const pqproxy_stmt_cache_t *cache,
                     const pq_bind_t *bind, const pqproxy_identity_t *id);
+
+/**
+ * Simple Query ('Q') policy. When reject_simple_query is non-zero (default),
+ * emit ErrorResponse 0A000 + ReadyForQuery. Identity inject is not possible
+ * on the simple protocol, so extended-only is the secure default.
+ */
+int pqproxy_on_simple_query(pqwire_ctx_t *frontend, int reject_simple_query,
+                            const char *sql);
 
 void pqproxy_identity_clear(pqproxy_identity_t *id);
 
@@ -100,6 +110,11 @@ typedef struct {
     const char *metrics_http_host;  /* default 127.0.0.1; NULL with port 0 = off */
     uint16_t    metrics_http_port;  /* 0 = disable HTTP /metrics (default 9108) */
     int         fair_schedule;      /* RR among frontends waiting on pool (default 1) */
+    /**
+     * Reject simple Query ('Q') messages (default 1). When 0, simple Query
+     * may be forwarded without identity inject (insecure; dev only).
+     */
+    int         reject_simple_query;
 } pqproxy_config_t;
 
 void pqproxy_config_defaults(pqproxy_config_t *cfg);

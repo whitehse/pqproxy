@@ -663,21 +663,50 @@ static int after_backend_release(server_t *srv, conn_t *c)
 static int submit_be_send(server_t *srv, conn_t *c);
 static int submit_be_recv(server_t *srv, conn_t *c);
 
+/**
+ * Backend pipeline finished (RFQ). On ErrorResponse: skip local BindComplete,
+ * deliver Error+RFQ to FE, drop queued FE work for this pipeline, count fail.
+ */
 static int backend_async_complete(server_t *srv, conn_t *c)
 {
+    const pqwire_pipeline_status_t *st;
+    int had_error = 0;
+
     if (c->be_start_ns) {
         pqproxy_metrics_note_backend_wait_ns(mono_ns() - c->be_start_ns);
         c->be_start_ns = 0;
     }
-    pqproxy_metrics_inc_be_ok();
-    if (pqwire_send_bind_complete(c->frontend) != 0) {
-        return -1;
+
+    st = c->be ? pqproxy_backend_pipeline_status(c->be) : NULL;
+    if (st && st->saw_error) {
+        had_error = 1;
+        pqproxy_metrics_inc_be_fail();
+        /* Mid-pipeline failure: discard queued FE work for this transaction. */
+        feq_clear_all(c);
+        c->got_execute = 0;
+    } else {
+        pqproxy_metrics_inc_be_ok();
     }
+
+    if (!had_error) {
+        if (pqwire_send_bind_complete(c->frontend) != 0) {
+            return -1;
+        }
+    }
+    /* Error path: be_resp already contains ErrorResponse (+ usually RFQ).
+     * Success path: CommandComplete/DataRow/... (+ RFQ when Sync was sent). */
     if (c->got_sync && c->be_resp_len > 0) {
         if (queue_plain_send(srv, c, c->be_resp, c->be_resp_len) != 0) {
             return -1;
         }
         c->be_resp_len = 0;
+    } else if (had_error && c->be_resp_len > 0) {
+        /* Client has not Synced yet — still push Error+RFQ so FE is clean. */
+        if (queue_plain_send(srv, c, c->be_resp, c->be_resp_len) != 0) {
+            return -1;
+        }
+        c->be_resp_len = 0;
+        c->got_sync = 0;
     } else if (c->got_sync && c->be_resp_len == 0) {
         if (pqwire_send_ready_for_query(c->frontend) != 0) {
             return -1;
@@ -687,6 +716,7 @@ static int backend_async_complete(server_t *srv, conn_t *c)
         return -1;
     }
     if (c->be) {
+        /* Backend wire already marked READY via pipeline feed helpers. */
         pqproxy_backend_async_finish(srv->pool, c->be, 0);
         c->be = NULL;
     }
@@ -949,10 +979,24 @@ static int drain_fe_queue(server_t *srv, conn_t *c)
             }
             break;
         case FEQ_QUERY:
-            (void)pqwire_send_error_response(
-                c->frontend, "ERROR", "0A000",
-                "simple Query disabled; use extended protocol");
-            (void)pqwire_send_ready_for_query(c->frontend);
+            if (srv->cfg->reject_simple_query || !srv->pool || !c->identity_ready) {
+                (void)pqproxy_on_simple_query(c->frontend,
+                                              srv->cfg->reject_simple_query,
+                                              it.query_sql);
+            } else {
+                size_t rlen = 0;
+                pqwire_pipeline_status_t st;
+                if (pqproxy_backend_exec_query(srv->pool, c->id.group, it.query_sql,
+                                               c->be_resp, sizeof(c->be_resp),
+                                               &rlen, &st) == 0 && rlen > 0) {
+                    (void)queue_plain_send(srv, c, c->be_resp, rlen);
+                } else {
+                    (void)pqwire_send_error_response(
+                        c->frontend, "ERROR", "08006",
+                        "simple Query backend forward failed");
+                    (void)pqwire_send_ready_for_query(c->frontend);
+                }
+            }
             break;
         case FEQ_TERMINATE:
             c->state = CS_CLOSING;
@@ -1093,11 +1137,43 @@ static int process_frontend(server_t *srv, conn_t *c)
             break;
 
         case PQ_EVENT_QUERY:
-            if (pqwire_send_error_response(
-                    c->frontend, "ERROR", "0A000",
-                    "simple Query disabled; use extended protocol") != 0 ||
-                pqwire_send_ready_for_query(c->frontend) != 0) {
-                return -1;
+            if (c->be_wait != BE_IDLE) {
+                feq_item_t it;
+                memset(&it, 0, sizeof(it));
+                it.kind = FEQ_QUERY;
+                if (ev.payload.query.sql) {
+                    strncpy(it.query_sql, ev.payload.query.sql,
+                            sizeof(it.query_sql) - 1);
+                }
+                if (feq_push(c, &it) != 0) {
+                    (void)pqwire_send_error_response(c->frontend, "ERROR", "53300",
+                                                     "frontend request queue full");
+                    (void)pqwire_send_ready_for_query(c->frontend);
+                }
+                break;
+            }
+            if (srv->cfg->reject_simple_query || !srv->pool || !c->identity_ready) {
+                if (pqproxy_on_simple_query(c->frontend, srv->cfg->reject_simple_query,
+                                            ev.payload.query.sql) != 0) {
+                    return -1;
+                }
+            } else {
+                size_t rlen = 0;
+                pqwire_pipeline_status_t st;
+                if (pqproxy_backend_exec_query(
+                        srv->pool, c->id.group,
+                        ev.payload.query.sql ? ev.payload.query.sql : "",
+                        c->be_resp, sizeof(c->be_resp), &rlen, &st) == 0 &&
+                    rlen > 0) {
+                    if (queue_plain_send(srv, c, c->be_resp, rlen) != 0) {
+                        return -1;
+                    }
+                } else if (pqwire_send_error_response(
+                               c->frontend, "ERROR", "08006",
+                               "simple Query backend forward failed") != 0 ||
+                           pqwire_send_ready_for_query(c->frontend) != 0) {
+                    return -1;
+                }
             }
             break;
 
@@ -1347,6 +1423,7 @@ void pqproxy_config_defaults(pqproxy_config_t *cfg)
     cfg->metrics_http_host = "127.0.0.1";
     cfg->metrics_http_port = 9108;
     cfg->fair_schedule = 1;
+    cfg->reject_simple_query = 1;
 }
 
 int pqproxy_run(const pqproxy_config_t *cfg)

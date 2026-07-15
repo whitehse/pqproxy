@@ -39,11 +39,11 @@ Further work to explore. Ordered roughly by dependency.
 ## Rewrite engine
 
 - [x] Interface sketch: intercept Parse, inject Bind, unnamed pipeline
-- [ ] Per-frontend hash table of prepared statements
+- [x] Per-frontend hash table of prepared statements (open-addressing FNV-1a)
 - [ ] Configurable identity parameter slot (by name or index)
-- [ ] Pipeline error recovery: drain to ReadyForQuery, reset frontend state
-- [ ] Reject or rewrite dangerous simple Query ('Q') when policy requires extended only
-- [ ] Dialectic unit tests without live Postgres
+- [x] Pipeline error recovery: drain to ReadyForQuery, skip BindComplete on Error, clear FE queue
+- [x] Reject simple Query ('Q') by default (`reject_simple_query` / `--allow-simple-query`)
+- [x] Dialectic unit tests without live Postgres (hash cache, policy, pipeline status)
 
 ## Hardening / ops
 
@@ -54,7 +54,7 @@ Further work to explore. Ordered roughly by dependency.
 
 ## Library follow-ups (track in pique/TODO.md too)
 
-- [ ] pique: mid-pipeline error helpers
+- [x] pique: mid-pipeline error helpers (`pqwire_pipeline_*`, `pqwire_msg_peek`)
 - [ ] pique: zero-copy Bind rewrite
 - [ ] bonsai_pki: cert identity helpers for mTLS
 

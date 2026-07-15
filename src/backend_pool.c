@@ -51,6 +51,7 @@ struct pqproxy_backend_conn {
     uint8_t         recv_acc[BE_RECV_CAP];
     size_t          recv_acc_len;
     int             skip_parse_bind;
+    pqwire_pipeline_status_t pipe_st;
 };
 
 struct pqproxy_backend_pool {
@@ -812,20 +813,23 @@ pqwire_ctx_t *pqproxy_backend_wire(pqproxy_backend_conn_t *conn)
     return conn ? conn->wire : NULL;
 }
 
-int pqproxy_backend_flush_pipeline(pqproxy_backend_conn_t *conn,
-                                   uint8_t *out, size_t out_cap, size_t *out_len,
-                                   int skip_parse_bind_complete)
+int pqproxy_backend_flush_pipeline_ex(pqproxy_backend_conn_t *conn,
+                                      uint8_t *out, size_t out_cap, size_t *out_len,
+                                      int skip_parse_bind_complete,
+                                      pqwire_pipeline_status_t *status_out)
 {
     uint8_t buf[16384];
     size_t n;
     size_t olen = 0;
-    int saw_rfq = 0;
     int rounds = 0;
+    pqwire_pipeline_status_t st;
 
     if (!conn || !conn->alive || !conn->wire || !out || !out_len) {
         return -1;
     }
     *out_len = 0;
+    pqwire_pipeline_status_init(&st);
+    conn->pipe_st = st;
 
     /* Send all queued wire output */
     for (;;) {
@@ -839,32 +843,17 @@ int pqproxy_backend_flush_pipeline(pqproxy_backend_conn_t *conn,
         }
     }
 
-    while (!saw_rfq && rounds++ < 256) {
+    while (!st.complete && rounds++ < 256) {
         size_t mlen = 0;
         if (read_msg(conn->fd, buf, sizeof(buf), &mlen) != 0) {
             conn->alive = 0;
             return -1;
         }
-        (void)pqwire_feed_input(conn->wire, buf, mlen);
-
-        /* Drain events (for state) */
-        {
-            protocol_event_t ev;
-            while (pqwire_next_event(conn->wire, &ev) == 1) {
-                if (ev.type == PQ_EVENT_READY_FOR_QUERY) {
-                    saw_rfq = 1;
-                }
-                if (ev.type == PQ_EVENT_ERROR_RESPONSE) {
-                    /* still forward raw message below */
-                }
-            }
+        if (pqwire_pipeline_feed_backend_msg(conn->wire, &st, buf, mlen) != 0) {
+            conn->alive = 0;
+            return -1;
         }
-
-        if (skip_parse_bind_complete && (buf[0] == '1' || buf[0] == '2')) {
-            continue; /* frontend already got local Parse/Bind complete */
-        }
-        /* Skip noisy backend ParameterStatus / Notice during pipeline */
-        if (buf[0] == 'S' || buf[0] == 'N' || buf[0] == 'K') {
+        if (pqwire_pipeline_filter_backend_type((char)buf[0], skip_parse_bind_complete)) {
             continue;
         }
         if (olen + mlen > out_cap) {
@@ -872,19 +861,29 @@ int pqproxy_backend_flush_pipeline(pqproxy_backend_conn_t *conn,
         }
         memcpy(out + olen, buf, mlen);
         olen += mlen;
-        if (buf[0] == 'Z') {
-            saw_rfq = 1;
-        }
     }
     *out_len = olen;
-    return saw_rfq ? 0 : -1;
+    conn->pipe_st = st;
+    if (status_out) {
+        *status_out = st;
+    }
+    return st.complete ? 0 : -1;
 }
 
-int pqproxy_backend_exec_bind(pqproxy_backend_pool_t *pool,
-                              const pqproxy_stmt_cache_t *cache,
-                              const pq_bind_t *bind,
-                              const pqproxy_identity_t *id,
-                              uint8_t *out, size_t out_cap, size_t *out_len)
+int pqproxy_backend_flush_pipeline(pqproxy_backend_conn_t *conn,
+                                   uint8_t *out, size_t out_cap, size_t *out_len,
+                                   int skip_parse_bind_complete)
+{
+    return pqproxy_backend_flush_pipeline_ex(conn, out, out_cap, out_len,
+                                             skip_parse_bind_complete, NULL);
+}
+
+int pqproxy_backend_exec_bind_ex(pqproxy_backend_pool_t *pool,
+                                 const pqproxy_stmt_cache_t *cache,
+                                 const pq_bind_t *bind,
+                                 const pqproxy_identity_t *id,
+                                 uint8_t *out, size_t out_cap, size_t *out_len,
+                                 pqwire_pipeline_status_t *status_out)
 {
     pqproxy_backend_conn_t *be;
     int rc;
@@ -903,14 +902,62 @@ int pqproxy_backend_exec_bind(pqproxy_backend_pool_t *pool,
         while (pqwire_get_output(be->wire, dump, sizeof(dump)) > 0) {
         }
     }
+    pqwire_pipeline_status_init(&be->pipe_st);
 
     if (pqproxy_on_bind(be->wire, cache, bind, id) != 0) {
         pqproxy_backend_checkin(pool, be);
         return -1;
     }
-    rc = pqproxy_backend_flush_pipeline(be, out, out_cap, out_len, 1);
+    rc = pqproxy_backend_flush_pipeline_ex(be, out, out_cap, out_len, 1, status_out);
     pqproxy_backend_checkin(pool, be);
     return rc;
+}
+
+int pqproxy_backend_exec_bind(pqproxy_backend_pool_t *pool,
+                              const pqproxy_stmt_cache_t *cache,
+                              const pq_bind_t *bind,
+                              const pqproxy_identity_t *id,
+                              uint8_t *out, size_t out_cap, size_t *out_len)
+{
+    return pqproxy_backend_exec_bind_ex(pool, cache, bind, id, out, out_cap, out_len,
+                                        NULL);
+}
+
+int pqproxy_backend_exec_query(pqproxy_backend_pool_t *pool,
+                               const char *group,
+                               const char *sql,
+                               uint8_t *out, size_t out_cap, size_t *out_len,
+                               pqwire_pipeline_status_t *status_out)
+{
+    pqproxy_backend_conn_t *be;
+    int rc;
+
+    if (!pool || !sql || !out || !out_len) {
+        return -1;
+    }
+    *out_len = 0;
+    be = pqproxy_backend_checkout(pool, group);
+    if (!be) {
+        return -1;
+    }
+    {
+        uint8_t dump[1024];
+        while (pqwire_get_output(be->wire, dump, sizeof(dump)) > 0) {
+        }
+    }
+    if (pqwire_send_query(be->wire, sql) != 0) {
+        pqproxy_backend_checkin(pool, be);
+        return -1;
+    }
+    rc = pqproxy_backend_flush_pipeline_ex(be, out, out_cap, out_len, 0, status_out);
+    pqproxy_backend_checkin(pool, be);
+    return rc;
+}
+
+const pqwire_pipeline_status_t *pqproxy_backend_pipeline_status(
+    const pqproxy_backend_conn_t *conn)
+{
+    return conn ? &conn->pipe_st : NULL;
 }
 
 /* ── Async helpers ───────────────────────────────────────────────────── */
@@ -920,23 +967,21 @@ static int be_filter_append(pqproxy_backend_conn_t *conn, const uint8_t *msg,
                             size_t *out_len, int *saw_rfq)
 {
     char type;
+    size_t total;
+
     if (!msg || mlen < 5) {
         return -1;
     }
-    type = (char)msg[0];
-    (void)pqwire_feed_input(conn->wire, msg, mlen);
-    {
-        protocol_event_t ev;
-        while (pqwire_next_event(conn->wire, &ev) == 1) {
-            if (ev.type == PQ_EVENT_READY_FOR_QUERY && saw_rfq) {
-                *saw_rfq = 1;
-            }
+    if (pqwire_msg_peek(msg, mlen, &type, &total) != 0 || total != mlen) {
+        return -1;
+    }
+    if (pqwire_pipeline_feed_backend_msg(conn->wire, &conn->pipe_st, msg, mlen) != 0) {
+        return -1;
+    }
+    if (pqwire_pipeline_filter_backend_type(type, conn->skip_parse_bind)) {
+        if (saw_rfq && conn->pipe_st.complete) {
+            *saw_rfq = 1;
         }
-    }
-    if (conn->skip_parse_bind && (type == '1' || type == '2')) {
-        return 0;
-    }
-    if (type == 'S' || type == 'N' || type == 'K') {
         return 0;
     }
     if (*out_len + mlen > out_cap) {
@@ -944,7 +989,7 @@ static int be_filter_append(pqproxy_backend_conn_t *conn, const uint8_t *msg,
     }
     memcpy(out + *out_len, msg, mlen);
     *out_len += mlen;
-    if (type == 'Z' && saw_rfq) {
+    if (saw_rfq && conn->pipe_st.complete) {
         *saw_rfq = 1;
     }
     return 0;
@@ -976,6 +1021,7 @@ int pqproxy_backend_async_begin(pqproxy_backend_pool_t *pool,
     be->send_len = be->send_off = 0;
     be->recv_acc_len = 0;
     be->skip_parse_bind = 1;
+    pqwire_pipeline_status_init(&be->pipe_st);
 
     if (pqproxy_on_bind(be->wire, cache, bind, id) != 0) {
         pqproxy_backend_checkin(pool, be);

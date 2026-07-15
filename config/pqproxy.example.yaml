@@ -42,3 +42,6 @@ quiet: false
 
 # Round-robin among frontends waiting for a free backend connection
 fair_schedule: true
+
+# Reject simple Query ('Q'); identity inject requires extended protocol
+reject_simple_query: true

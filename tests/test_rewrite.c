@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 static size_t write_startup(uint8_t *buf, size_t cap)
 {
@@ -31,7 +32,7 @@ static size_t write_startup(uint8_t *buf, size_t cap)
     return p;
 }
 
-int main(void)
+static void test_identity_inject(void)
 {
     pqwire_ctx_t *frontend = pqwire_create(PQWIRE_ROLE_SERVER);
     pqwire_ctx_t *backend = pqwire_create(PQWIRE_ROLE_CLIENT);
@@ -53,7 +54,6 @@ int main(void)
     assert(pqproxy_identity_from_cert_subject("router-9:region_east", &id) == 0);
     assert(strcmp(id.router_id, "router-9") == 0);
 
-    /* Frontend must see Startup before typed messages (server role). */
     n = write_startup(buf, sizeof(buf));
     assert(n > 0);
     pqwire_feed_input(frontend, buf, n);
@@ -61,7 +61,6 @@ int main(void)
         assert(ev.type == PQ_EVENT_STARTUP);
     }
 
-    /* Client sends Parse + Bind with forged identity in $1 */
     assert(pqwire_send_parse(client, "st1", sql, NULL, 0) == 0);
     lengths[0] = (int32_t)strlen("forged-id");
     values[0] = (const uint8_t *)"forged-id";
@@ -87,11 +86,9 @@ int main(void)
     assert(got_parse && got_bind);
     assert(pqproxy_stmt_cache_get(&cache, "st1") != NULL);
 
-    /* Frontend ParseComplete */
     n = pqwire_get_output(frontend, buf, sizeof(buf));
     assert(n >= 5 && buf[0] == '1');
 
-    /* Backend unnamed Parse + Bind with injected identity */
     n = pqwire_get_output(backend, buf, sizeof(buf));
     assert(n > 0);
     assert(buf[0] == 'P');
@@ -120,9 +117,134 @@ int main(void)
         pqwire_destroy(be_srv);
     }
 
-    printf("rewrite engine test PASSED (identity injection)\n");
     pqwire_destroy(frontend);
     pqwire_destroy(backend);
     pqwire_destroy(client);
+    printf("  PASS: identity injection\n");
+}
+
+static void test_stmt_hash_cache(void)
+{
+    pqproxy_stmt_cache_t cache;
+    pq_parse_t p;
+    char name[32];
+    int i;
+    const pqwire_prepared_stmt_t *got;
+
+    pqproxy_stmt_cache_init(&cache);
+    for (i = 0; i < 48; i++) {
+        memset(&p, 0, sizeof(p));
+        snprintf(name, sizeof(name), "stmt_%d", i);
+        strncpy(p.statement, name, sizeof(p.statement) - 1);
+        snprintf(p.query, sizeof(p.query), "SELECT %d", i);
+        assert(pqproxy_stmt_cache_put(&cache, &p, 0) == 0);
+    }
+    assert(cache.count == 48);
+    for (i = 0; i < 48; i++) {
+        snprintf(name, sizeof(name), "stmt_%d", i);
+        got = pqproxy_stmt_cache_get(&cache, name);
+        assert(got != NULL);
+        assert(strstr(got->query, name + 5) != NULL || got->query[0] == 'S');
+    }
+    /* update existing */
+    memset(&p, 0, sizeof(p));
+    strncpy(p.statement, "stmt_7", sizeof(p.statement) - 1);
+    strncpy(p.query, "SELECT 777", sizeof(p.query) - 1);
+    assert(pqproxy_stmt_cache_put(&cache, &p, 1) == 0);
+    assert(cache.count == 48);
+    got = pqproxy_stmt_cache_get(&cache, "stmt_7");
+    assert(got && strcmp(got->query, "SELECT 777") == 0);
+    assert(got->identity_param_slot == 1);
+
+    assert(pqproxy_stmt_cache_remove(&cache, "stmt_7") == 0);
+    assert(pqproxy_stmt_cache_get(&cache, "stmt_7") == NULL);
+    assert(cache.count == 47);
+    /* neighbors still findable after rehash */
+    assert(pqproxy_stmt_cache_get(&cache, "stmt_0") != NULL);
+    assert(pqproxy_stmt_cache_get(&cache, "stmt_47") != NULL);
+
+    printf("  PASS: stmt hash cache\n");
+}
+
+static void test_simple_query_policy(void)
+{
+    pqwire_ctx_t *fe = pqwire_create(PQWIRE_ROLE_SERVER);
+    uint8_t buf[512];
+    size_t n;
+    uint8_t startup[64];
+    size_t sp;
+    protocol_event_t ev;
+
+    assert(fe);
+    sp = write_startup(startup, sizeof(startup));
+    pqwire_feed_input(fe, startup, sp);
+    while (pqwire_next_event(fe, &ev)) {
+    }
+
+    assert(pqproxy_on_simple_query(fe, 1, "SELECT 1") == 0);
+    n = pqwire_get_output(fe, buf, sizeof(buf));
+    assert(n >= 5);
+    assert(buf[0] == 'E'); /* ErrorResponse */
+    /* should also include RFQ */
+    {
+        size_t off = 0;
+        int saw_e = 0, saw_z = 0;
+        while (off + 5 <= n) {
+            char type;
+            size_t total;
+            assert(pqwire_msg_peek(buf + off, n - off, &type, &total) == 0);
+            if (type == 'E') {
+                saw_e = 1;
+            }
+            if (type == 'Z') {
+                saw_z = 1;
+            }
+            off += total;
+        }
+        assert(saw_e && saw_z);
+    }
+    printf("  PASS: simple Query reject policy\n");
+    pqwire_destroy(fe);
+}
+
+static void test_pipeline_error_observe(void)
+{
+    /* Dialectic without live PG: Error then RFQ status */
+    pqwire_ctx_t *srv = pqwire_create(PQWIRE_ROLE_SERVER);
+    pqwire_ctx_t *cli = pqwire_create(PQWIRE_ROLE_CLIENT);
+    pqwire_pipeline_status_t st;
+    uint8_t buf[1024];
+    size_t n, off;
+    char type;
+    size_t total;
+
+    assert(srv && cli);
+    pqwire_pipeline_status_init(&st);
+    assert(pqwire_send_error_response(srv, "ERROR", "23505", "duplicate") == 0);
+    assert(pqwire_send_ready_for_query(srv) == 0);
+    n = pqwire_get_output(srv, buf, sizeof(buf));
+    off = 0;
+    while (off < n) {
+        assert(pqwire_msg_peek(buf + off, n - off, &type, &total) == 0);
+        assert(pqwire_pipeline_feed_backend_msg(cli, &st, buf + off, total) == 0);
+        off += total;
+    }
+    assert(st.saw_error == 1);
+    assert(st.complete == 1);
+    assert(strcmp(st.last_error.code, "23505") == 0);
+    assert(pqwire_pipeline_filter_backend_type('1', 1) == 1);
+    assert(pqwire_pipeline_filter_backend_type('E', 1) == 0);
+    pqwire_destroy(srv);
+    pqwire_destroy(cli);
+    printf("  PASS: pipeline error observe (dialectic)\n");
+}
+
+int main(void)
+{
+    test_identity_inject();
+    test_stmt_hash_cache();
+    test_simple_query_policy();
+    test_pipeline_error_observe();
+    printf("rewrite engine tests PASSED\n");
     return 0;
 }

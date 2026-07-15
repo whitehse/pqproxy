@@ -34,7 +34,8 @@ static void test_nested(void)
         "  http: \"127.0.0.1:9200\"\n"
         "maintain_ms: 2500\n"
         "quiet: true\n"
-        "fair_schedule: false\n";
+        "fair_schedule: false\n"
+        "reject_simple_query: false\n";
     pqproxy_config_bundle_t b;
     char err[128];
 
@@ -60,6 +61,7 @@ static void test_nested(void)
     assert(b.cfg.maintain_interval_ms == 2500);
     assert(b.cfg.quiet == 1);
     assert(b.cfg.fair_schedule == 0);
+    assert(b.cfg.reject_simple_query == 0);
     pqproxy_config_bundle_free(&b);
     printf("  PASS: nested YAML keys\n");
 }
@@ -98,6 +100,7 @@ static void test_defaults_empty(void)
     assert(b.cfg.listen_port == 6432);
     assert(b.cfg.metrics_http_port == 9108);
     assert(b.cfg.fair_schedule == 1);
+    assert(b.cfg.reject_simple_query == 1);
     pqproxy_config_bundle_free(&b);
     printf("  PASS: empty/defaults\n");
 }

@@ -62,22 +62,59 @@ pqwire_ctx_t *pqproxy_backend_wire(pqproxy_backend_conn_t *conn);
  * until ReadyForQuery ('Z'). Copies filtered backend messages into out
  * (skips Authentication/ParameterStatus; optionally skips Parse/Bind complete).
  *
- * Returns 0 on success, -1 on I/O or protocol error.
+ * When status_out is non-NULL, fills pipeline recovery status (ErrorResponse
+ * seen, RFQ complete, last SQLSTATE/message).
+ *
+ * Returns 0 on success (RFQ observed), -1 on I/O or protocol error.
+ * A backend SQL error still returns 0 if RFQ was reached (check status_out).
  */
 int pqproxy_backend_flush_pipeline(pqproxy_backend_conn_t *conn,
                                    uint8_t *out, size_t out_cap, size_t *out_len,
                                    int skip_parse_bind_complete);
 
 /**
+ * Same as flush_pipeline but reports pipeline status (ErrorResponse / RFQ).
+ */
+int pqproxy_backend_flush_pipeline_ex(pqproxy_backend_conn_t *conn,
+                                      uint8_t *out, size_t out_cap, size_t *out_len,
+                                      int skip_parse_bind_complete,
+                                      pqwire_pipeline_status_t *status_out);
+
+/**
+ * Last async pipeline status for a backend connection (after on_recv complete).
+ * Valid until the next async_begin / checkin.
+ */
+const pqwire_pipeline_status_t *pqproxy_backend_pipeline_status(
+    const pqproxy_backend_conn_t *conn);
+
+/**
  * High-level: inject Bind → unnamed pipeline on a checked-out backend,
  * run flush, return filtered response bytes for the frontend.
  * (Blocking I/O — used by tests and as fallback.)
+ * When status_out non-NULL, reports whether the pipeline saw ErrorResponse.
  */
 int pqproxy_backend_exec_bind(pqproxy_backend_pool_t *pool,
                               const pqproxy_stmt_cache_t *cache,
                               const pq_bind_t *bind,
                               const pqproxy_identity_t *id,
                               uint8_t *out, size_t out_cap, size_t *out_len);
+
+int pqproxy_backend_exec_bind_ex(pqproxy_backend_pool_t *pool,
+                                 const pqproxy_stmt_cache_t *cache,
+                                 const pq_bind_t *bind,
+                                 const pqproxy_identity_t *id,
+                                 uint8_t *out, size_t out_cap, size_t *out_len,
+                                 pqwire_pipeline_status_t *status_out);
+
+/**
+ * Forward a simple Query string to a backend (no identity inject).
+ * Dev/allow-simple-query path only.
+ */
+int pqproxy_backend_exec_query(pqproxy_backend_pool_t *pool,
+                               const char *group,
+                               const char *sql,
+                               uint8_t *out, size_t out_cap, size_t *out_len,
+                               pqwire_pipeline_status_t *status_out);
 
 /* ── Async / io_uring-friendly pipeline ──────────────────────────────── */
 

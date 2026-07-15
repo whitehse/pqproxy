@@ -34,6 +34,8 @@ static void usage(const char *argv0)
             "  --no-metrics-http    disable Prometheus /metrics HTTP\n"
             "  --fair               fair RR among frontends waiting on pool (default)\n"
             "  --no-fair            disable fair frontend scheduling\n"
+            "  --reject-simple-query  reject simple Query 'Q' (default; extended only)\n"
+            "  --allow-simple-query   insecure: forward simple Query without inject\n"
             "  --quiet              less logging\n"
             "  -h, --help           this help\n",
             argv0);
@@ -132,6 +134,17 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "--no-fair") == 0) {
             cfg->fair_schedule = 0;
+            continue;
+        }
+        if (strcmp(argv[i], "--reject-simple-query") == 0) {
+            cfg->reject_simple_query = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--allow-simple-query") == 0) {
+            cfg->reject_simple_query = 0;
+            fprintf(stderr,
+                    "pqproxy: warning: --allow-simple-query forwards 'Q' without "
+                    "identity inject (insecure)\n");
             continue;
         }
         if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {

@@ -83,6 +83,25 @@ When many frontends share a limited backend pool:
 
 Disable with `--no-fair` / `fair_schedule: false`.
 
+## Pipeline error recovery
+
+Backend responses are classified with pique `pqwire_pipeline_*` helpers:
+
+1. Messages are drained until ReadyForQuery (`Z`), even after ErrorResponse (`E`)
+2. On SQL error: skip local BindComplete, forward Error+RFQ to the frontend, clear the FE request queue, count `backend_pipelines_fail`
+3. Backend CLIENT wire is marked READY via `pqwire_note_ready` without a full `pqwire_reset` (auth state retained)
+
+## Simple Query policy
+
+Simple Query (`Q`) cannot carry Bind-slot identity inject. Default is **reject**
+(`reject_simple_query: true`, SQLSTATE `0A000`). `--allow-simple-query` forwards
+to the backend without inject (insecure; development only).
+
+## Prepared statement cache
+
+Per-frontend open-addressing hash table (FNV-1a) of up to
+`PQPROXY_MAX_CACHED_STMTS` (64) prepared statement names.
+
 ## Configuration
 
 - YAML via `--config FILE` (sibling **libyaml**); CLI flags override file values
