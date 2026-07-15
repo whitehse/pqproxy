@@ -20,6 +20,11 @@ static void usage(const char *argv0)
             "  --backend-password P backend password (empty = trust)\n"
             "  --backend-database D default postgres\n"
             "  --backend-pool N     warmed connections (default 4)\n"
+            "  --backend-group-login  login to PG as client group (role)\n"
+            "  --backend-groups LIST  comma-separated roles to pre-warm\n"
+            "  --no-lazy-group      do not open backends on demand for new groups\n"
+            "  --ktls-prefer        prefer TLS1.2 AES-GCM for kTLS (default)\n"
+            "  --no-ktls-prefer     allow TLS1.3 (may disable kTLS offload)\n"
             "  --quiet              less logging\n"
             "  -h, --help           this help\n",
             argv0);
@@ -128,6 +133,26 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "--backend-pool") == 0 && i + 1 < argc) {
             cfg.backend_pool_size = (size_t)atoi(argv[++i]);
+            continue;
+        }
+        if (strcmp(argv[i], "--backend-group-login") == 0) {
+            cfg.backend_use_group_as_user = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--backend-groups") == 0 && i + 1 < argc) {
+            cfg.backend_groups = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--no-lazy-group") == 0) {
+            cfg.backend_lazy_group = 0;
+            continue;
+        }
+        if (strcmp(argv[i], "--ktls-prefer") == 0) {
+            cfg.prefer_tls12_ktls = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--no-ktls-prefer") == 0) {
+            cfg.prefer_tls12_ktls = 0;
             continue;
         }
         fprintf(stderr, "unknown argument: %s\n", argv[i]);

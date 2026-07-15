@@ -91,7 +91,10 @@ typedef struct {
     const char *backend_password;
     const char *backend_database;
     int         backend_use_group_as_user;
+    const char *backend_groups;      /* comma-separated roles to pre-warm */
+    int         backend_lazy_group;  /* default 1 */
     size_t      backend_pool_size;
+    int         prefer_tls12_ktls;   /* prefer TLS1.2 AES-GCM for kTLS (default 1) */
 } pqproxy_config_t;
 
 void pqproxy_config_defaults(pqproxy_config_t *cfg);

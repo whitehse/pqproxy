@@ -7,7 +7,9 @@
  * frontend needs a backend round-trip.
  */
 
+#define _GNU_SOURCE
 #include "backend_pool.h"
+#include "scram_client.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -21,6 +23,15 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+#define PQ_AUTH_OK           0
+#define PQ_AUTH_CLEARTEXT    3
+#define PQ_AUTH_SASL         10
+#define PQ_AUTH_SASL_CONT    11
+#define PQ_AUTH_SASL_FINAL   12
+
+#define MAX_BACKEND_GROUPS   16
+#define MAX_GROUP_NAME       64
 
 struct pqproxy_backend_conn {
     int             fd;
@@ -37,6 +48,11 @@ struct pqproxy_backend_pool {
     char            user[128];
     char            password[128];
     char            database[128];
+    char            groups[MAX_BACKEND_GROUPS][MAX_GROUP_NAME];
+    size_t          n_groups;
+    int             use_group_as_user;
+    int             lazy_connect;
+    size_t          max_conns;
     pqproxy_backend_conn_t *conns;
     size_t          n;
 };
@@ -55,6 +71,45 @@ void pqproxy_backend_config_defaults(pqproxy_backend_config_t *cfg)
     cfg->pool_size = 4;
     cfg->connect_timeout_ms = 3000;
     cfg->io_timeout_ms = 5000;
+    cfg->use_group_as_user = 0;
+    cfg->groups = NULL;
+    cfg->lazy_group_connect = 1;
+}
+
+static size_t parse_groups(const char *csv, char out[][MAX_GROUP_NAME], size_t maxn)
+{
+    size_t n = 0;
+    const char *p;
+    if (!csv || !csv[0]) {
+        return 0;
+    }
+    p = csv;
+    while (*p && n < maxn) {
+        size_t len = 0;
+        while (p[len] && p[len] != ',') {
+            len++;
+        }
+        while (len > 0 && (p[0] == ' ' || p[0] == '\t')) {
+            p++;
+            len--;
+        }
+        {
+            size_t end = len;
+            while (end > 0 && (p[end - 1] == ' ' || p[end - 1] == '\t')) {
+                end--;
+            }
+            if (end > 0 && end < MAX_GROUP_NAME) {
+                memcpy(out[n], p, end);
+                out[n][end] = '\0';
+                n++;
+            }
+        }
+        p += len;
+        if (*p == ',') {
+            p++;
+        }
+    }
+    return n;
 }
 
 static int set_timeouts(int fd, int ms)
@@ -173,10 +228,60 @@ static int read_msg(int fd, uint8_t *buf, size_t cap, size_t *out_len)
     return 0;
 }
 
+static void put_be32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)((v >> 24) & 0xFF);
+    p[1] = (uint8_t)((v >> 16) & 0xFF);
+    p[2] = (uint8_t)((v >> 8) & 0xFF);
+    p[3] = (uint8_t)(v & 0xFF);
+}
+
+/** SASLInitialResponse: 'p' + mechanism\\0 + int32(data_len) + data */
+static int send_sasl_initial(int fd, const char *mech, const char *data)
+{
+    size_t mlen = strlen(mech) + 1;
+    size_t dlen = data ? strlen(data) : 0;
+    size_t body = mlen + 4 + dlen;
+    uint8_t *msg = malloc(5 + body);
+    if (!msg) {
+        return -1;
+    }
+    msg[0] = 'p';
+    put_be32(msg + 1, (uint32_t)(4 + body));
+    memcpy(msg + 5, mech, mlen);
+    put_be32(msg + 5 + mlen, (uint32_t)dlen);
+    if (dlen) {
+        memcpy(msg + 5 + mlen + 4, data, dlen);
+    }
+    {
+        int rc = write_all(fd, msg, 5 + body);
+        free(msg);
+        return rc;
+    }
+}
+
+/** SASLResponse: 'p' + raw client-final bytes */
+static int send_sasl_response(int fd, const char *data)
+{
+    size_t dlen = data ? strlen(data) : 0;
+    uint8_t *msg = malloc(5 + dlen);
+    if (!msg) {
+        return -1;
+    }
+    msg[0] = 'p';
+    put_be32(msg + 1, (uint32_t)(4 + dlen));
+    if (dlen) {
+        memcpy(msg + 5, data, dlen);
+    }
+    {
+        int rc = write_all(fd, msg, 5 + dlen);
+        free(msg);
+        return rc;
+    }
+}
+
 /**
- * Minimal backend auth: Startup → wait for AuthOk (R, int32=0) or cleartext
- * request (R, int32=3) with password, then ReadyForQuery.
- * SCRAM full negotiation is deferred; empty password expects trust.
+ * Backend auth: trust / cleartext / SCRAM-SHA-256.
  */
 static int backend_authenticate(pqproxy_backend_conn_t *c, const char *user,
                                 const char *password, const char *database,
@@ -184,9 +289,13 @@ static int backend_authenticate(pqproxy_backend_conn_t *c, const char *user,
 {
     uint8_t buf[8192];
     size_t n;
-    int saw_auth_ok = 0;
     int saw_rfq = 0;
     int rounds = 0;
+    pq_scram_t scram;
+    int scram_active = 0;
+    char gs2[320];
+    char bare[288];
+    char final_msg[512];
 
     if (pqwire_send_startup(c->wire, user, database) != 0) {
         return -1;
@@ -204,37 +313,85 @@ static int backend_authenticate(pqproxy_backend_conn_t *c, const char *user,
         }
         (void)pqwire_feed_input(c->wire, buf, mlen);
 
-        /* Cleartext password request: type R, body auth type 3 */
         if (mlen >= 9 && buf[0] == 'R') {
             uint32_t atype = ((uint32_t)buf[5] << 24) | ((uint32_t)buf[6] << 16) |
                              ((uint32_t)buf[7] << 8) | (uint32_t)buf[8];
-            if (atype == 3 && password && password[0]) {
-                /* PasswordMessage 'p' */
-                size_t plen = strlen(password) + 1;
+            const char *payload = (const char *)(buf + 9);
+            size_t plen = mlen - 9;
+
+            if (atype == PQ_AUTH_OK) {
+                /* continue until RFQ */
+            } else if (atype == PQ_AUTH_CLEARTEXT) {
+                size_t pwlen = password ? strlen(password) + 1 : 1;
                 uint8_t pmsg[512];
-                if (5 + plen > sizeof(pmsg)) {
+                if (5 + pwlen > sizeof(pmsg)) {
                     return -1;
                 }
                 pmsg[0] = 'p';
-                pmsg[1] = (uint8_t)(((plen + 4) >> 24) & 0xFF);
-                pmsg[2] = (uint8_t)(((plen + 4) >> 16) & 0xFF);
-                pmsg[3] = (uint8_t)(((plen + 4) >> 8) & 0xFF);
-                pmsg[4] = (uint8_t)((plen + 4) & 0xFF);
-                memcpy(pmsg + 5, password, plen);
-                if (write_all(c->fd, pmsg, 5 + plen) != 0) {
+                put_be32(pmsg + 1, (uint32_t)(4 + pwlen));
+                if (password) {
+                    memcpy(pmsg + 5, password, pwlen);
+                } else {
+                    pmsg[5] = 0;
+                }
+                if (write_all(c->fd, pmsg, 5 + pwlen) != 0) {
                     return -1;
                 }
-            } else if (atype == 10 && !quiet) {
-                fprintf(stderr,
-                        "pqproxy: backend requested SCRAM; use trust or "
-                        "cleartext for pool warm-up v1\n");
+            } else if (atype == PQ_AUTH_SASL) {
+                /* mechanisms list; require SCRAM-SHA-256 */
+                if (!password) {
+                    password = "";
+                }
+                if (!memmem(payload, plen, "SCRAM-SHA-256", 13)) {
+                    if (!quiet) {
+                        fprintf(stderr, "pqproxy: backend SASL without SCRAM-SHA-256\n");
+                    }
+                    return -1;
+                }
+                if (pq_scram_init(&scram, user) != 0 ||
+                    pq_scram_client_first(&scram, gs2, sizeof(gs2), bare, sizeof(bare)) != 0) {
+                    return -1;
+                }
+                if (send_sasl_initial(c->fd, "SCRAM-SHA-256", gs2) != 0) {
+                    return -1;
+                }
+                scram_active = 1;
+            } else if (atype == PQ_AUTH_SASL_CONT && scram_active) {
+                char server_first[512];
+                if (plen >= sizeof(server_first)) {
+                    return -1;
+                }
+                memcpy(server_first, payload, plen);
+                server_first[plen] = '\0';
+                if (pq_scram_handle_server_first(&scram, server_first, password) != 0) {
+                    if (!quiet) {
+                        fprintf(stderr, "pqproxy: SCRAM server-first failed\n");
+                    }
+                    return -1;
+                }
+                if (pq_scram_client_final(&scram, final_msg, sizeof(final_msg)) != 0 ||
+                    send_sasl_response(c->fd, final_msg) != 0) {
+                    return -1;
+                }
+            } else if (atype == PQ_AUTH_SASL_FINAL && scram_active) {
+                char server_final[512];
+                if (plen >= sizeof(server_final)) {
+                    return -1;
+                }
+                memcpy(server_final, payload, plen);
+                server_final[plen] = '\0';
+                if (pq_scram_verify_server_final(&scram, server_final) != 0) {
+                    if (!quiet) {
+                        fprintf(stderr, "pqproxy: SCRAM server signature mismatch\n");
+                    }
+                    return -1;
+                }
+            } else if (atype != PQ_AUTH_OK && !quiet) {
+                fprintf(stderr, "pqproxy: unsupported auth type %u\n", atype);
             }
         }
 
         while (pqwire_next_event(c->wire, &ev) == 1) {
-            if (ev.type == PQ_EVENT_AUTHENTICATION_OK) {
-                saw_auth_ok = 1;
-            }
             if (ev.type == PQ_EVENT_READY_FOR_QUERY) {
                 saw_rfq = 1;
             }
@@ -246,7 +403,6 @@ static int backend_authenticate(pqproxy_backend_conn_t *c, const char *user,
                 return -1;
             }
         }
-        (void)saw_auth_ok;
     }
     return saw_rfq ? 0 : -1;
 }
@@ -302,23 +458,62 @@ pqproxy_backend_pool_t *pqproxy_backend_pool_create(const pqproxy_backend_config
     strncpy(pool->database,
             cfg->database && cfg->database[0] ? cfg->database : "postgres",
             sizeof(pool->database) - 1);
+    pool->use_group_as_user = cfg->use_group_as_user;
+    pool->lazy_connect = cfg->lazy_group_connect;
+    pool->n_groups = parse_groups(cfg->groups, pool->groups, MAX_BACKEND_GROUPS);
+
     pool->n = cfg->pool_size ? cfg->pool_size : 4;
-    if (pool->n > 64) {
-        pool->n = 64;
+    if (pool->use_group_as_user && pool->n_groups > 0) {
+        /* At least one connection per group */
+        if (pool->n < pool->n_groups) {
+            pool->n = pool->n_groups;
+        }
     }
-    pool->conns = calloc(pool->n, sizeof(pqproxy_backend_conn_t));
+    pool->max_conns = pool->n + (pool->lazy_connect ? 16 : 0);
+    if (pool->max_conns > 64) {
+        pool->max_conns = 64;
+    }
+    if (pool->n > pool->max_conns) {
+        pool->n = pool->max_conns;
+    }
+    pool->conns = calloc(pool->max_conns, sizeof(pqproxy_backend_conn_t));
     if (!pool->conns) {
         free(pool);
         return NULL;
     }
-
-    for (i = 0; i < pool->n; i++) {
+    for (i = 0; i < pool->max_conns; i++) {
         pool->conns[i].slot = (int)i;
-        /* v1: all conns login as fixed user; group mapping is checkout preference */
-        if (warm_one(pool, &pool->conns[i], pool->user) == 0) {
-            ok++;
-        } else if (!cfg->quiet) {
-            fprintf(stderr, "pqproxy: backend warm-up failed slot=%zu\n", i);
+        pool->conns[i].fd = -1;
+    }
+
+    if (pool->use_group_as_user && pool->n_groups > 0) {
+        size_t per = pool->n / pool->n_groups;
+        size_t extra = pool->n % pool->n_groups;
+        size_t slot = 0;
+        size_t g;
+        if (per == 0) {
+            per = 1;
+        }
+        for (g = 0; g < pool->n_groups && slot < pool->n; g++) {
+            size_t count = per + (g < extra ? 1 : 0);
+            size_t j;
+            for (j = 0; j < count && slot < pool->n; j++, slot++) {
+                if (warm_one(pool, &pool->conns[slot], pool->groups[g]) == 0) {
+                    ok++;
+                } else if (!cfg->quiet) {
+                    fprintf(stderr,
+                            "pqproxy: warm-up failed group=%s slot=%zu\n",
+                            pool->groups[g], slot);
+                }
+            }
+        }
+    } else {
+        for (i = 0; i < pool->n; i++) {
+            if (warm_one(pool, &pool->conns[i], pool->user) == 0) {
+                ok++;
+            } else if (!cfg->quiet) {
+                fprintf(stderr, "pqproxy: backend warm-up failed slot=%zu\n", i);
+            }
         }
     }
     if (ok == 0) {
@@ -326,9 +521,11 @@ pqproxy_backend_pool_t *pqproxy_backend_pool_create(const pqproxy_backend_config
         return NULL;
     }
     if (!cfg->quiet) {
-        fprintf(stderr, "pqproxy: backend pool %s:%u alive=%zu/%zu user=%s db=%s\n",
+        fprintf(stderr,
+                "pqproxy: backend pool %s:%u alive=%zu/%zu user=%s db=%s "
+                "group_login=%d groups=%zu\n",
                 pool->host, (unsigned)pool->cfg.port, ok, pool->n, pool->user,
-                pool->database);
+                pool->database, pool->use_group_as_user, pool->n_groups);
     }
     return pool;
 }
@@ -340,7 +537,7 @@ void pqproxy_backend_pool_destroy(pqproxy_backend_pool_t *pool)
         return;
     }
     if (pool->conns) {
-        for (i = 0; i < pool->n; i++) {
+        for (i = 0; i < pool->max_conns; i++) {
             if (pool->conns[i].wire) {
                 pqwire_destroy(pool->conns[i].wire);
             }
@@ -359,7 +556,7 @@ int pqproxy_backend_pool_alive(const pqproxy_backend_pool_t *pool)
     if (!pool) {
         return 0;
     }
-    for (i = 0; i < pool->n; i++) {
+    for (i = 0; i < pool->max_conns; i++) {
         if (pool->conns[i].alive) {
             return 1;
         }
@@ -375,7 +572,7 @@ pqproxy_backend_conn_t *pqproxy_backend_checkout(pqproxy_backend_pool_t *pool,
     if (!pool) {
         return NULL;
     }
-    for (i = 0; i < pool->n; i++) {
+    for (i = 0; i < pool->max_conns; i++) {
         pqproxy_backend_conn_t *c = &pool->conns[i];
         if (!c->alive || c->busy) {
             continue;
@@ -384,9 +581,41 @@ pqproxy_backend_conn_t *pqproxy_backend_checkout(pqproxy_backend_pool_t *pool,
             c->busy = 1;
             return c;
         }
-        if (!fallback) {
+        if (!pool->use_group_as_user && !fallback) {
             fallback = c;
         }
+        /* When group login is on, only fall back if no group match at all later */
+        if (pool->use_group_as_user && !fallback) {
+            fallback = c;
+        }
+    }
+    if (pool->use_group_as_user && group && group[0]) {
+        /* Prefer exact group; if none, lazy-open as group */
+        for (i = 0; i < pool->max_conns; i++) {
+            pqproxy_backend_conn_t *c = &pool->conns[i];
+            if (c->alive && !c->busy && strcmp(c->login_user, group) == 0) {
+                c->busy = 1;
+                return c;
+            }
+        }
+        if (pool->lazy_connect) {
+            for (i = 0; i < pool->max_conns; i++) {
+                pqproxy_backend_conn_t *c = &pool->conns[i];
+                if (!c->alive && c->fd < 0) {
+                    if (warm_one(pool, c, group) == 0) {
+                        c->busy = 1;
+                        if (!pool->cfg.quiet) {
+                            fprintf(stderr, "pqproxy: lazy backend login as %s\n",
+                                    group);
+                        }
+                        return c;
+                    }
+                    break;
+                }
+            }
+        }
+        /* No exact group: refuse fallback to wrong role (security) */
+        return NULL;
     }
     if (fallback) {
         fallback->busy = 1;

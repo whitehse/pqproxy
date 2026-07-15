@@ -32,6 +32,20 @@ SSL_CTX *pqproxy_tls_ctx_create(const pqproxy_config_t *cfg)
     }
 
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    /*
+     * Prefer TLS 1.2 AES-GCM for Kernel TLS offload. Many kernels only arm
+     * kTLS reliably for TLS 1.2 record crypto; TLS 1.3 still works in software.
+     */
+    if (cfg->prefer_tls12_ktls) {
+        SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+        if (SSL_CTX_set_cipher_list(ctx,
+                "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:"
+                "AES128-GCM-SHA256:AES256-GCM-SHA384") != 1) {
+            fprintf(stderr, "pqproxy: warning: cipher list for kTLS failed\n");
+        }
+    } else {
+        SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+    }
     mode = SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER;
     SSL_CTX_set_mode(ctx, mode);
     pqproxy_tls_enable_ktls_ctx(ctx);

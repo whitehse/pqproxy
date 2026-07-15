@@ -17,9 +17,11 @@ typedef struct {
     const char *host;          /* default 127.0.0.1 */
     uint16_t    port;          /* default 5432 */
     const char *user;          /* fixed user if not use_group_as_user */
-    const char *password;      /* optional; empty = trust/peer */
+    const char *password;      /* optional; empty = trust/peer; used for SCRAM */
     const char *database;      /* default postgres */
-    int         use_group_as_user; /* login as identity.group */
+    int         use_group_as_user; /* login as identity.group (DB role) */
+    const char *groups;        /* comma-separated roles to pre-warm when group login */
+    int         lazy_group_connect; /* open new backend as group on demand (default 1) */
     size_t      pool_size;     /* total pre-warmed conns (default 4) */
     int         connect_timeout_ms;
     int         io_timeout_ms;

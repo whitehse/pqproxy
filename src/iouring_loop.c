@@ -611,6 +611,8 @@ void pqproxy_config_defaults(pqproxy_config_t *cfg)
     cfg->identity_slot = 0;
     cfg->backend_port = 5432;
     cfg->backend_pool_size = 4;
+    cfg->backend_lazy_group = 1;
+    cfg->prefer_tls12_ktls = 1;
 }
 
 int pqproxy_run(const pqproxy_config_t *cfg)
@@ -656,6 +658,8 @@ int pqproxy_run(const pqproxy_config_t *cfg)
         bcfg.password = cfg->backend_password ? cfg->backend_password : "";
         bcfg.database = cfg->backend_database ? cfg->backend_database : "postgres";
         bcfg.use_group_as_user = cfg->backend_use_group_as_user;
+        bcfg.groups = cfg->backend_groups;
+        bcfg.lazy_group_connect = cfg->backend_lazy_group;
         bcfg.pool_size = cfg->backend_pool_size ? cfg->backend_pool_size : 4;
         bcfg.quiet = cfg->quiet;
         srv->pool = pqproxy_backend_pool_create(&bcfg);

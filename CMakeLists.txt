@@ -30,6 +30,7 @@ add_library(pqproxy_core STATIC
     src/identity.c
     src/tls_mtls.c
     src/ktls.c
+    src/scram_client.c
     src/backend_pool.c
     src/iouring_loop.c
 )
@@ -61,3 +62,7 @@ add_test(NAME identity_parse COMMAND test_identity)
 add_executable(test_backend_pool tests/test_backend_pool.c)
 target_link_libraries(test_backend_pool PRIVATE pqproxy_core pthread)
 add_test(NAME backend_pool COMMAND test_backend_pool)
+
+add_executable(test_scram_client tests/test_scram_client.c)
+target_link_libraries(test_scram_client PRIVATE pqproxy_core)
+add_test(NAME scram_client COMMAND test_scram_client)

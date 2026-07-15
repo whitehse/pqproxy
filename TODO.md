@@ -18,7 +18,8 @@ Further work to explore. Ordered roughly by dependency.
 - [x] OpenSSL mTLS via `SSL_set_fd` + client cert required
 - [x] Extract router_id / group from cert (CN + OU)
 - [x] `SSL_OP_ENABLE_KTLS` + log ktls_tx/rx when kernel arms offload
-- [ ] Broader kTLS coverage (TLS 1.2 AES-GCM profile, zerocopy sendfile)
+- [x] Prefer TLS 1.2 AES-GCM for kTLS (`--ktls-prefer`, default on)
+- [ ] Zerocopy sendfile / further kTLS TX path tuning
 - [ ] MSG_ZEROCOPY / buffer slice writes to backends
 
 ## Connection pool
@@ -27,8 +28,8 @@ Further work to explore. Ordered roughly by dependency.
 - [x] Trust/cleartext auth at warm-up; CLI `--backend*` flags
 - [x] Bind → inject → pipeline → filter responses to frontend
 - [x] Mock dialectic test (`test_backend_pool`)
-- [ ] Full SCRAM-SHA-256 warm-up (when backends require it)
-- [ ] Per-group login (`--backend-use-group-as-user`) multi-role pools
+- [x] Full SCRAM-SHA-256 warm-up (`scram_client.c`, OpenSSL PBKDF2/HMAC)
+- [x] Per-group login (`--backend-group-login`, `--backend-groups`, lazy open)
 - [ ] Fair scheduling when many frontends share one backend
 - [ ] Health check / reconnect on backend ErrorResponse / EOF
 
