@@ -26,6 +26,8 @@ typedef struct {
     int         connect_timeout_ms;
     int         io_timeout_ms;
     int         quiet;
+    int         auto_reconnect;      /* re-warm dead slots (default 1) */
+    int         health_check_on_checkout; /* lightweight Sync probe (default 0) */
 } pqproxy_backend_config_t;
 
 void pqproxy_backend_config_defaults(pqproxy_backend_config_t *cfg);
@@ -123,6 +125,35 @@ void pqproxy_backend_async_finish(pqproxy_backend_pool_t *pool,
 
 /** Set non-blocking mode on all live backends (after warm-up). */
 int pqproxy_backend_pool_set_nonblock(pqproxy_backend_pool_t *pool);
+
+/**
+ * Mark connection dead (close fd/wire) without checkin; used on I/O errors.
+ * Does not free the slot — call async_finish or reconnect.
+ */
+void pqproxy_backend_mark_dead(pqproxy_backend_conn_t *conn);
+
+/**
+ * Re-authenticate a dead or failed slot as its previous login_user.
+ * Returns 0 on success (conn alive, still busy if it was).
+ */
+int pqproxy_backend_reconnect(pqproxy_backend_pool_t *pool,
+                              pqproxy_backend_conn_t *conn);
+
+/**
+ * Walk pool and reconnect any dead, non-busy slots (maintenance tick).
+ * Returns number of successfully re-warmed connections.
+ */
+int pqproxy_backend_pool_maintain(pqproxy_backend_pool_t *pool);
+
+/**
+ * Optional health probe: send empty Sync (or Query SELECT 1) and wait RFQ.
+ * Blocking. Returns 0 healthy, -1 dead (conn marked dead).
+ */
+int pqproxy_backend_health_check(pqproxy_backend_pool_t *pool,
+                                 pqproxy_backend_conn_t *conn);
+
+/** Count of live connections. */
+size_t pqproxy_backend_pool_live_count(const pqproxy_backend_pool_t *pool);
 
 #ifdef __cplusplus
 }

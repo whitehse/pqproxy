@@ -75,3 +75,7 @@ add_test(NAME scram_live_pg
 set_tests_properties(scram_live_pg PROPERTIES
                      TIMEOUT 60
                      ENVIRONMENT "PQPROXY_SKIP_LIVE_PG=$ENV{PQPROXY_SKIP_LIVE_PG}")
+
+add_executable(test_reconnect tests/test_reconnect.c)
+target_link_libraries(test_reconnect PRIVATE pqproxy_core pthread)
+add_test(NAME backend_reconnect COMMAND test_reconnect)

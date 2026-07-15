@@ -84,6 +84,8 @@ void pqproxy_backend_config_defaults(pqproxy_backend_config_t *cfg)
     cfg->use_group_as_user = 0;
     cfg->groups = NULL;
     cfg->lazy_group_connect = 1;
+    cfg->auto_reconnect = 1;
+    cfg->health_check_on_checkout = 0;
 }
 
 static size_t parse_groups(const char *csv, char out[][MAX_GROUP_NAME], size_t maxn)
@@ -417,9 +419,28 @@ static int backend_authenticate(pqproxy_backend_conn_t *c, const char *user,
     return saw_rfq ? 0 : -1;
 }
 
+static void conn_teardown_io(pqproxy_backend_conn_t *c)
+{
+    if (!c) {
+        return;
+    }
+    if (c->wire) {
+        pqwire_destroy(c->wire);
+        c->wire = NULL;
+    }
+    if (c->fd >= 0) {
+        close(c->fd);
+        c->fd = -1;
+    }
+    c->alive = 0;
+    c->send_len = c->send_off = 0;
+    c->recv_acc_len = 0;
+}
+
 static int warm_one(pqproxy_backend_pool_t *pool, pqproxy_backend_conn_t *c,
                     const char *login_user)
 {
+    conn_teardown_io(c);
     c->fd = tcp_connect(pool->host, pool->cfg.port, pool->cfg.connect_timeout_ms);
     if (c->fd < 0) {
         return -1;
@@ -434,15 +455,115 @@ static int warm_one(pqproxy_backend_pool_t *pool, pqproxy_backend_conn_t *c,
     strncpy(c->login_user, login_user, sizeof(c->login_user) - 1);
     if (backend_authenticate(c, login_user, pool->password, pool->database,
                              pool->cfg.quiet) != 0) {
-        pqwire_destroy(c->wire);
-        c->wire = NULL;
-        close(c->fd);
-        c->fd = -1;
+        conn_teardown_io(c);
         return -1;
     }
     c->alive = 1;
     c->busy = 0;
+    /* Leave blocking for sync tests/flush; async path calls set_nonblock. */
     return 0;
+}
+
+void pqproxy_backend_mark_dead(pqproxy_backend_conn_t *conn)
+{
+    conn_teardown_io(conn);
+}
+
+int pqproxy_backend_reconnect(pqproxy_backend_pool_t *pool,
+                              pqproxy_backend_conn_t *conn)
+{
+    char user[128];
+    int was_busy;
+    if (!pool || !conn) {
+        return -1;
+    }
+    was_busy = conn->busy;
+    if (conn->login_user[0]) {
+        strncpy(user, conn->login_user, sizeof(user) - 1);
+        user[sizeof(user) - 1] = '\0';
+    } else {
+        strncpy(user, pool->user, sizeof(user) - 1);
+        user[sizeof(user) - 1] = '\0';
+    }
+    if (warm_one(pool, conn, user) != 0) {
+        if (!pool->cfg.quiet) {
+            fprintf(stderr, "pqproxy: reconnect failed user=%s slot=%d\n",
+                    user, conn->slot);
+        }
+        return -1;
+    }
+    conn->busy = was_busy;
+    if (!pool->cfg.quiet) {
+        fprintf(stderr, "pqproxy: reconnected backend user=%s slot=%d\n",
+                user, conn->slot);
+    }
+    return 0;
+}
+
+int pqproxy_backend_pool_maintain(pqproxy_backend_pool_t *pool)
+{
+    size_t i;
+    int n = 0;
+    if (!pool || !pool->cfg.auto_reconnect) {
+        return 0;
+    }
+    for (i = 0; i < pool->max_conns; i++) {
+        pqproxy_backend_conn_t *c = &pool->conns[i];
+        if (c->busy) {
+            continue;
+        }
+        if (!c->alive && c->login_user[0]) {
+            if (pqproxy_backend_reconnect(pool, c) == 0) {
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+int pqproxy_backend_health_check(pqproxy_backend_pool_t *pool,
+                                 pqproxy_backend_conn_t *conn)
+{
+    uint8_t out[2048];
+    size_t olen = 0;
+    uint8_t dump[256];
+    if (!pool || !conn || !conn->alive || !conn->wire) {
+        return -1;
+    }
+    /* Temporarily blocking for probe */
+    (void)set_timeouts(conn->fd, pool->cfg.io_timeout_ms > 0
+                                     ? pool->cfg.io_timeout_ms : 3000);
+    while (pqwire_get_output(conn->wire, dump, sizeof(dump)) > 0) {
+    }
+    if (pqwire_send_query(conn->wire, "SELECT 1") != 0) {
+        conn_teardown_io(conn);
+        return -1;
+    }
+    if (pqproxy_backend_flush_pipeline(conn, out, sizeof(out), &olen, 0) != 0) {
+        conn_teardown_io(conn);
+        return -1;
+    }
+    {
+        int flags = fcntl(conn->fd, F_GETFL, 0);
+        if (flags >= 0) {
+            (void)fcntl(conn->fd, F_SETFL, flags | O_NONBLOCK);
+        }
+    }
+    return 0;
+}
+
+size_t pqproxy_backend_pool_live_count(const pqproxy_backend_pool_t *pool)
+{
+    size_t i, n = 0;
+    if (!pool) {
+        return 0;
+    }
+    for (i = 0; i < pool->max_conns; i++) {
+        if (pool->conns[i].alive) {
+            n++;
+        }
+    }
+    return n;
 }
 
 pqproxy_backend_pool_t *pqproxy_backend_pool_create(const pqproxy_backend_config_t *cfg)
@@ -574,6 +695,29 @@ int pqproxy_backend_pool_alive(const pqproxy_backend_pool_t *pool)
     return 0;
 }
 
+static pqproxy_backend_conn_t *checkout_try(pqproxy_backend_pool_t *pool,
+                                            pqproxy_backend_conn_t *c)
+{
+    if (!c || !c->alive || c->busy) {
+        return NULL;
+    }
+    if (pool->cfg.health_check_on_checkout) {
+        c->busy = 1;
+        if (pqproxy_backend_health_check(pool, c) != 0) {
+            c->busy = 0;
+            if (pool->cfg.auto_reconnect &&
+                pqproxy_backend_reconnect(pool, c) == 0) {
+                c->busy = 1;
+                return c;
+            }
+            return NULL;
+        }
+        return c;
+    }
+    c->busy = 1;
+    return c;
+}
+
 pqproxy_backend_conn_t *pqproxy_backend_checkout(pqproxy_backend_pool_t *pool,
                                                  const char *group)
 {
@@ -582,36 +726,43 @@ pqproxy_backend_conn_t *pqproxy_backend_checkout(pqproxy_backend_pool_t *pool,
     if (!pool) {
         return NULL;
     }
+    /* Opportunistic re-warm of idle dead slots */
+    if (pool->cfg.auto_reconnect) {
+        (void)pqproxy_backend_pool_maintain(pool);
+    }
     for (i = 0; i < pool->max_conns; i++) {
         pqproxy_backend_conn_t *c = &pool->conns[i];
         if (!c->alive || c->busy) {
             continue;
         }
         if (group && group[0] && strcmp(c->login_user, group) == 0) {
-            c->busy = 1;
-            return c;
+            pqproxy_backend_conn_t *got = checkout_try(pool, c);
+            if (got) {
+                return got;
+            }
+            continue;
         }
         if (!pool->use_group_as_user && !fallback) {
             fallback = c;
         }
-        /* When group login is on, only fall back if no group match at all later */
         if (pool->use_group_as_user && !fallback) {
             fallback = c;
         }
     }
     if (pool->use_group_as_user && group && group[0]) {
-        /* Prefer exact group; if none, lazy-open as group */
         for (i = 0; i < pool->max_conns; i++) {
             pqproxy_backend_conn_t *c = &pool->conns[i];
             if (c->alive && !c->busy && strcmp(c->login_user, group) == 0) {
-                c->busy = 1;
-                return c;
+                pqproxy_backend_conn_t *got = checkout_try(pool, c);
+                if (got) {
+                    return got;
+                }
             }
         }
         if (pool->lazy_connect) {
             for (i = 0; i < pool->max_conns; i++) {
                 pqproxy_backend_conn_t *c = &pool->conns[i];
-                if (!c->alive && c->fd < 0) {
+                if (!c->alive) {
                     if (warm_one(pool, c, group) == 0) {
                         c->busy = 1;
                         if (!pool->cfg.quiet) {
@@ -624,13 +775,12 @@ pqproxy_backend_conn_t *pqproxy_backend_checkout(pqproxy_backend_pool_t *pool,
                 }
             }
         }
-        /* No exact group: refuse fallback to wrong role (security) */
         return NULL;
     }
     if (fallback) {
-        fallback->busy = 1;
+        return checkout_try(pool, fallback);
     }
-    return fallback;
+    return NULL;
 }
 
 void pqproxy_backend_checkin(pqproxy_backend_pool_t *pool, pqproxy_backend_conn_t *conn)
@@ -935,14 +1085,17 @@ void pqproxy_backend_async_finish(pqproxy_backend_pool_t *pool,
         return;
     }
     if (failed) {
-        conn->alive = 0;
-        if (conn->fd >= 0) {
-            close(conn->fd);
-            conn->fd = -1;
+        char user[128];
+        strncpy(user, conn->login_user, sizeof(user) - 1);
+        user[sizeof(user) - 1] = '\0';
+        conn_teardown_io(conn);
+        if (user[0]) {
+            strncpy(conn->login_user, user, sizeof(conn->login_user) - 1);
         }
-        if (conn->wire) {
-            pqwire_destroy(conn->wire);
-            conn->wire = NULL;
+        /* Eager reconnect so next checkout can succeed */
+        if (pool && pool->cfg.auto_reconnect && conn->login_user[0]) {
+            (void)pqproxy_backend_reconnect(pool, conn);
+            conn->busy = 0; /* reconnect leaves busy as was; force free */
         }
     }
     conn->send_len = conn->send_off = 0;

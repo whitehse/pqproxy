@@ -33,7 +33,8 @@ Further work to explore. Ordered roughly by dependency.
 - [ ] Fair scheduling when many frontends share one backend
 - [x] Async backend I/O on io_uring (OP_BE_SEND/RECV, nonblock pool)
 - [x] Live SCRAM against ephemeral Postgres (`scram_live_pg` / run_live_scram_test.sh)
-- [ ] Health check / reconnect on backend ErrorResponse / EOF
+- [x] Health check / reconnect on backend ErrorResponse / EOF
+- [x] Frontend request queue while backend pipeline in flight
 
 ## Rewrite engine
 

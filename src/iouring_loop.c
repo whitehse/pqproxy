@@ -44,6 +44,31 @@ typedef enum {
     BE_READING
 } be_wait_t;
 
+/* Queued frontend work while a backend pipeline is in flight */
+#define FE_Q_MAX 32
+typedef enum {
+    FEQ_NONE = 0,
+    FEQ_PARSE,
+    FEQ_BIND,
+    FEQ_EXECUTE,
+    FEQ_SYNC,
+    FEQ_QUERY,
+    FEQ_TERMINATE
+} feq_kind_t;
+
+typedef struct {
+    feq_kind_t kind;
+    pq_parse_t parse;
+    /* Owned bind params for FEQ_BIND */
+    char       bind_stmt[PQWIRE_MAX_STMT_NAME];
+    char       bind_portal[PQWIRE_MAX_PORTAL_NAME];
+    uint16_t   n_params;
+    pqwire_param_t params[PQWIRE_MAX_BIND_PARAMS];
+    uint16_t   n_result_formats;
+    int16_t    result_formats[PQWIRE_MAX_BIND_PARAMS];
+    char       query_sql[PQWIRE_MAX_QUERY_LEN];
+} feq_item_t;
+
 typedef struct {
     int             fd;
     conn_state_t    state;
@@ -75,6 +100,13 @@ typedef struct {
     size_t          be_resp_len;
     uint8_t         be_recv_buf[PQPROXY_IO_BUF];
 
+    /* Request queue (during BE_SENDING/READING) */
+    feq_item_t      fe_q[FE_Q_MAX];
+    size_t          fe_q_head;
+    size_t          fe_q_tail;
+    size_t          fe_q_count;
+    int             draining_queue; /* re-entrancy guard */
+
     int             slot;
 } conn_t;
 
@@ -92,6 +124,10 @@ typedef struct {
 } server_t;
 
 static server_t *g_server;
+
+static void feq_clear_all(conn_t *c);
+static int drain_fe_queue(server_t *srv, conn_t *c);
+static int queue_plain_send(server_t *srv, conn_t *c, const uint8_t *data, size_t len);
 
 static void on_signal(int sig)
 {
@@ -206,6 +242,7 @@ static void close_conn(server_t *srv, conn_t *c)
     c->send_pending = c->recv_pending = c->poll_pending = 0;
     c->be_send_pending = c->be_recv_pending = 0;
     c->be_wait = BE_IDLE;
+    feq_clear_all(c);
     (void)srv;
 }
 
@@ -298,6 +335,109 @@ static int queue_plain_send(server_t *srv, conn_t *c, const uint8_t *data, size_
 }
 
 
+
+static void feq_clear_item(feq_item_t *it)
+{
+    uint16_t i;
+    if (!it) {
+        return;
+    }
+    for (i = 0; i < it->n_params; i++) {
+        pqwire_param_clear(&it->params[i]);
+    }
+    memset(it, 0, sizeof(*it));
+}
+
+static void feq_clear_all(conn_t *c)
+{
+    size_t i;
+    for (i = 0; i < FE_Q_MAX; i++) {
+        feq_clear_item(&c->fe_q[i]);
+    }
+    c->fe_q_head = c->fe_q_tail = c->fe_q_count = 0;
+}
+
+static int feq_push(conn_t *c, const feq_item_t *item)
+{
+    if (!c || !item || c->fe_q_count >= FE_Q_MAX) {
+        return -1;
+    }
+    c->fe_q[c->fe_q_tail] = *item; /* params ownership transferred */
+    c->fe_q_tail = (c->fe_q_tail + 1) % FE_Q_MAX;
+    c->fe_q_count++;
+    return 0;
+}
+
+static int feq_pop(conn_t *c, feq_item_t *out)
+{
+    if (!c || !out || c->fe_q_count == 0) {
+        return 0;
+    }
+    *out = c->fe_q[c->fe_q_head];
+    memset(&c->fe_q[c->fe_q_head], 0, sizeof(c->fe_q[0]));
+    c->fe_q_head = (c->fe_q_head + 1) % FE_Q_MAX;
+    c->fe_q_count--;
+    return 1;
+}
+
+static int feq_push_parse(conn_t *c, const pq_parse_t *parse)
+{
+    feq_item_t it;
+    memset(&it, 0, sizeof(it));
+    it.kind = FEQ_PARSE;
+    it.parse = *parse;
+    return feq_push(c, &it);
+}
+
+static int feq_push_bind(conn_t *c, const pq_bind_t *bind)
+{
+    feq_item_t it;
+    uint16_t i;
+    memset(&it, 0, sizeof(it));
+    it.kind = FEQ_BIND;
+    strncpy(it.bind_stmt, bind->statement, sizeof(it.bind_stmt) - 1);
+    strncpy(it.bind_portal, bind->portal, sizeof(it.bind_portal) - 1);
+    it.n_params = bind->n_params;
+    if (it.n_params > PQWIRE_MAX_BIND_PARAMS) {
+        it.n_params = PQWIRE_MAX_BIND_PARAMS;
+    }
+    for (i = 0; i < it.n_params; i++) {
+        const pq_bind_param_view_t *v = &bind->params[i];
+        it.params[i].format = v->format;
+        if (v->length < 0) {
+            pqwire_param_set_null(&it.params[i]);
+        } else if (v->format == 1) {
+            if (pqwire_param_set_binary(&it.params[i], v->data, (size_t)v->length) != 0) {
+                feq_clear_item(&it);
+                return -1;
+            }
+        } else {
+            char *tmp = malloc((size_t)v->length + 1);
+            if (!tmp) {
+                feq_clear_item(&it);
+                return -1;
+            }
+            memcpy(tmp, v->data, (size_t)v->length);
+            tmp[v->length] = '\0';
+            if (pqwire_param_set_text(&it.params[i], tmp) != 0) {
+                free(tmp);
+                feq_clear_item(&it);
+                return -1;
+            }
+            free(tmp);
+        }
+    }
+    it.n_result_formats = bind->n_result_formats;
+    if (it.n_result_formats > PQWIRE_MAX_BIND_PARAMS) {
+        it.n_result_formats = PQWIRE_MAX_BIND_PARAMS;
+    }
+    for (i = 0; i < it.n_result_formats; i++) {
+        it.result_formats[i] = bind->result_formats[i];
+    }
+    return feq_push(c, &it);
+}
+
+
 static int drain_frontend_out(server_t *srv, conn_t *c)
 {
     uint8_t out[PQPROXY_IO_BUF];
@@ -341,7 +481,7 @@ static int backend_async_complete(server_t *srv, conn_t *c)
     }
     c->be_wait = BE_IDLE;
     c->got_execute = c->got_sync = 0;
-    return 0;
+    return drain_fe_queue(srv, c);
 }
 
 static int backend_async_fail(server_t *srv, conn_t *c)
@@ -435,6 +575,169 @@ static int on_be_recv_cqe(server_t *srv, conn_t *c, int res)
     return submit_be_recv(srv, c);
 }
 
+
+static int start_async_bind_from_event(server_t *srv, conn_t *c, const pq_bind_t *bind)
+{
+    pqproxy_backend_conn_t *be = NULL;
+    if (pqproxy_backend_async_begin(srv->pool, &c->cache, bind, &c->id, &be) != 0) {
+        return -1;
+    }
+    c->be = be;
+    c->be_resp_len = 0;
+    if (submit_be_send(srv, c) != 0) {
+        return backend_async_fail(srv, c);
+    }
+    return 0;
+}
+
+static int start_async_bind_from_queue(server_t *srv, conn_t *c, feq_item_t *it)
+{
+    /* Reconstruct pq_bind_t views into on_bind via temporary wire path:
+     * use pqproxy_on_bind-compatible path by building a synthetic bind view. */
+    pq_bind_t bind;
+    pq_bind_param_view_t views[PQWIRE_MAX_BIND_PARAMS];
+    uint16_t i;
+    pqproxy_backend_conn_t *be = NULL;
+    int16_t formats[PQWIRE_MAX_BIND_PARAMS];
+    int32_t lengths[PQWIRE_MAX_BIND_PARAMS];
+    const uint8_t *values[PQWIRE_MAX_BIND_PARAMS];
+    const pqwire_prepared_stmt_t *prep;
+
+    memset(&bind, 0, sizeof(bind));
+    strncpy(bind.statement, it->bind_stmt, sizeof(bind.statement) - 1);
+    strncpy(bind.portal, it->bind_portal, sizeof(bind.portal) - 1);
+    bind.n_params = it->n_params;
+    for (i = 0; i < it->n_params; i++) {
+        views[i].length = it->params[i].length;
+        views[i].data = it->params[i].data;
+        views[i].format = it->params[i].format;
+        bind.params[i] = views[i];
+        formats[i] = it->params[i].format;
+        lengths[i] = it->params[i].length;
+        values[i] = it->params[i].data;
+    }
+    bind.n_formats = it->n_params;
+    for (i = 0; i < it->n_params; i++) {
+        bind.formats[i] = formats[i];
+    }
+    bind.n_result_formats = it->n_result_formats;
+    for (i = 0; i < it->n_result_formats; i++) {
+        bind.result_formats[i] = it->result_formats[i];
+    }
+
+    prep = pqproxy_stmt_cache_get(&c->cache, bind.statement);
+    if (!prep) {
+        return -1;
+    }
+    /* Prefer async_begin which calls on_bind */
+    if (pqproxy_backend_async_begin(srv->pool, &c->cache, &bind, &c->id, &be) != 0) {
+        return -1;
+    }
+    c->be = be;
+    c->be_resp_len = 0;
+    c->got_execute = c->got_sync = 0;
+    (void)lengths;
+    (void)values;
+    if (submit_be_send(srv, c) != 0) {
+        return backend_async_fail(srv, c);
+    }
+    return 0;
+}
+
+static int drain_fe_queue(server_t *srv, conn_t *c)
+{
+    feq_item_t it;
+    if (c->draining_queue) {
+        return 0;
+    }
+    c->draining_queue = 1;
+    while (c->be_wait == BE_IDLE && feq_pop(c, &it) == 1) {
+        int rc = 0;
+        switch (it.kind) {
+        case FEQ_PARSE:
+            rc = pqproxy_on_parse(c->frontend, &c->cache, &it.parse,
+                                  c->id.identity_slot >= 0
+                                      ? c->id.identity_slot
+                                      : srv->cfg->identity_slot);
+            if (rc != 0) {
+                (void)pqwire_send_error_response(c->frontend, "ERROR", "26000",
+                                                 "prepared statement cache full");
+                (void)pqwire_send_ready_for_query(c->frontend);
+            }
+            break;
+        case FEQ_BIND:
+            if (srv->pool && c->identity_ready && srv->async_backend) {
+                if (start_async_bind_from_queue(srv, c, &it) == 0) {
+                    feq_clear_item(&it);
+                    c->draining_queue = 0;
+                    return drain_frontend_out(srv, c);
+                }
+            }
+            if (srv->pool && c->identity_ready) {
+                /* Blocking fallback via reconstructed bind */
+                pq_bind_t bind;
+                uint16_t i;
+                size_t rlen = 0;
+                memset(&bind, 0, sizeof(bind));
+                strncpy(bind.statement, it.bind_stmt, sizeof(bind.statement) - 1);
+                bind.n_params = it.n_params;
+                for (i = 0; i < it.n_params; i++) {
+                    bind.params[i].length = it.params[i].length;
+                    bind.params[i].data = it.params[i].data;
+                    bind.params[i].format = it.params[i].format;
+                    bind.formats[i] = it.params[i].format;
+                }
+                bind.n_formats = it.n_params;
+                bind.n_result_formats = it.n_result_formats;
+                for (i = 0; i < it.n_result_formats; i++) {
+                    bind.result_formats[i] = it.result_formats[i];
+                }
+                if (pqproxy_backend_exec_bind(srv->pool, &c->cache, &bind, &c->id,
+                                              c->be_resp, sizeof(c->be_resp),
+                                              &rlen) == 0) {
+                    c->be_resp_len = rlen;
+                    (void)pqwire_send_bind_complete(c->frontend);
+                } else {
+                    (void)pqwire_send_bind_complete(c->frontend);
+                }
+            } else {
+                (void)pqwire_send_bind_complete(c->frontend);
+            }
+            break;
+        case FEQ_EXECUTE:
+            if (!srv->pool || c->be_resp_len == 0) {
+                (void)pqwire_send_command_complete(c->frontend, "SELECT 0");
+            }
+            break;
+        case FEQ_SYNC:
+            if (c->be_resp_len > 0) {
+                (void)queue_plain_send(srv, c, c->be_resp, c->be_resp_len);
+                c->be_resp_len = 0;
+            } else {
+                (void)pqwire_send_ready_for_query(c->frontend);
+            }
+            break;
+        case FEQ_QUERY:
+            (void)pqwire_send_error_response(
+                c->frontend, "ERROR", "0A000",
+                "simple Query disabled; use extended protocol");
+            (void)pqwire_send_ready_for_query(c->frontend);
+            break;
+        case FEQ_TERMINATE:
+            c->state = CS_CLOSING;
+            break;
+        default:
+            break;
+        }
+        feq_clear_item(&it);
+        if (c->be_wait != BE_IDLE) {
+            break;
+        }
+    }
+    c->draining_queue = 0;
+    return drain_frontend_out(srv, c);
+}
+
 static int process_frontend(server_t *srv, conn_t *c)
 {
     protocol_event_t ev;
@@ -456,6 +759,13 @@ static int process_frontend(server_t *srv, conn_t *c)
             break;
 
         case PQ_EVENT_PARSE:
+            if (c->be_wait != BE_IDLE) {
+                if (feq_push_parse(c, &ev.payload.parse) != 0) {
+                    (void)pqwire_send_error_response(c->frontend, "ERROR", "53300",
+                                                     "frontend request queue full");
+                }
+                break;
+            }
             if (pqproxy_on_parse(c->frontend, &c->cache, &ev.payload.parse,
                                  c->id.identity_slot >= 0
                                      ? c->id.identity_slot
@@ -467,18 +777,18 @@ static int process_frontend(server_t *srv, conn_t *c)
             break;
 
         case PQ_EVENT_BIND:
+            if (c->be_wait != BE_IDLE) {
+                if (feq_push_bind(c, &ev.payload.bind) != 0) {
+                    (void)pqwire_send_error_response(c->frontend, "ERROR", "53300",
+                                                     "frontend request queue full");
+                    (void)pqwire_send_ready_for_query(c->frontend);
+                }
+                break;
+            }
             c->be_resp_len = 0;
             c->got_execute = c->got_sync = 0;
-            if (srv->pool && c->identity_ready && srv->async_backend &&
-                c->be_wait == BE_IDLE) {
-                pqproxy_backend_conn_t *be = NULL;
-                if (pqproxy_backend_async_begin(srv->pool, &c->cache,
-                                                &ev.payload.bind, &c->id,
-                                                &be) == 0) {
-                    c->be = be;
-                    if (submit_be_send(srv, c) != 0) {
-                        return backend_async_fail(srv, c);
-                    }
+            if (srv->pool && c->identity_ready && srv->async_backend) {
+                if (start_async_bind_from_event(srv, c, &ev.payload.bind) == 0) {
                     break;
                 }
                 if (!srv->cfg->quiet) {
@@ -507,7 +817,12 @@ static int process_frontend(server_t *srv, conn_t *c)
 
         case PQ_EVENT_EXECUTE:
             if (c->be_wait != BE_IDLE) {
-                c->got_execute = 1;
+                feq_item_t it;
+                memset(&it, 0, sizeof(it));
+                it.kind = FEQ_EXECUTE;
+                if (feq_push(c, &it) != 0) {
+                    c->got_execute = 1;
+                }
                 break;
             }
             if (!srv->pool || c->be_resp_len == 0) {
@@ -519,6 +834,10 @@ static int process_frontend(server_t *srv, conn_t *c)
 
         case PQ_EVENT_SYNC:
             if (c->be_wait != BE_IDLE) {
+                feq_item_t it;
+                memset(&it, 0, sizeof(it));
+                it.kind = FEQ_SYNC;
+                (void)feq_push(c, &it);
                 c->got_sync = 1;
                 break;
             }
