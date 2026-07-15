@@ -19,8 +19,8 @@ Further work to explore. Ordered roughly by dependency.
 - [x] Extract router_id / group from cert (CN + OU)
 - [x] `SSL_OP_ENABLE_KTLS` + log ktls_tx/rx when kernel arms offload
 - [x] Prefer TLS 1.2 AES-GCM for kTLS (`--ktls-prefer`, default on)
-- [ ] Zerocopy sendfile / further kTLS TX path tuning
-- [ ] MSG_ZEROCOPY / buffer slice writes to backends
+- [x] kTLS TX zerocopy sendfile option on SSL_CTX + handshake note
+- [x] SO_ZEROCOPY / MSG_ZEROCOPY on large plain FE sends (`--msg-zerocopy`)
 
 ## Connection pool
 
@@ -40,7 +40,7 @@ Further work to explore. Ordered roughly by dependency.
 
 - [x] Interface sketch: intercept Parse, inject Bind, unnamed pipeline
 - [x] Per-frontend hash table of prepared statements (open-addressing FNV-1a)
-- [ ] Configurable identity parameter slot (by name or index)
+- [x] Configurable identity parameter slot (by name or index; INSERT column resolve)
 - [x] Pipeline error recovery: drain to ReadyForQuery, skip BindComplete on Error, clear FE queue
 - [x] Reject simple Query ('Q') by default (`reject_simple_query` / `--allow-simple-query`)
 - [x] Dialectic unit tests without live Postgres (hash cache, policy, pipeline status)
@@ -55,7 +55,7 @@ Further work to explore. Ordered roughly by dependency.
 ## Library follow-ups (track in pique/TODO.md too)
 
 - [x] pique: mid-pipeline error helpers (`pqwire_pipeline_*`, `pqwire_msg_peek`)
-- [ ] pique: zero-copy Bind rewrite
+- [x] pique: zero-copy Bind rewrite (`pqwire_bind_rewrite_identity_zerocopy`)
 - [ ] bonsai_pki: cert identity helpers for mTLS
 
 ## Ops / observability

@@ -306,6 +306,23 @@ static int apply_scalar(pqproxy_config_bundle_t *b, const char *key, const char 
         b->cfg.identity_slot = (int16_t)iv;
         return 0;
     }
+    if (strcmp(key, "identity.param") == 0 ||
+        strcmp(key, "identity.param_name") == 0 ||
+        strcmp(key, "identity_param") == 0) {
+        owned = bundle_strdup(b, val);
+        if (!owned) {
+            FAIL("oom");
+        }
+        b->cfg.identity_param_name = owned;
+        return 0;
+    }
+    if (strcmp(key, "msg_zerocopy") == 0 || strcmp(key, "zerocopy") == 0) {
+        if (parse_bool(val, &iv) != 0) {
+            FAIL("invalid bool");
+        }
+        b->cfg.msg_zerocopy = iv;
+        return 0;
+    }
     if (strcmp(key, "backend.host") == 0 || strcmp(key, "backend_host") == 0) {
         owned = bundle_strdup(b, val);
         if (!owned) {
@@ -481,7 +498,12 @@ static const char *const g_paths[] = {
     "ca",
     "ktls_prefer",
     "identity.slot",
+    "identity.param",
+    "identity.param_name",
     "identity_slot",
+    "identity_param",
+    "msg_zerocopy",
+    "zerocopy",
     "backend",
     "backend.host",
     "backend.port",

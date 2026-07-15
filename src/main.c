@@ -17,6 +17,8 @@ static void usage(const char *argv0)
             "  --plain              no TLS (development only)\n"
             "  --no-mtls            TLS without requiring client cert\n"
             "  --identity-slot N    Bind param index for router_id (default 0)\n"
+            "  --identity-param NAME  resolve slot from INSERT column name\n"
+            "  --msg-zerocopy       SO_ZEROCOPY + MSG_ZEROCOPY on large plain sends\n"
             "  --backend HOST:PORT  PostgreSQL backend for identity pool\n"
             "  --backend-user U     backend login (default postgres)\n"
             "  --backend-password P backend password (empty = trust)\n"
@@ -174,6 +176,14 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "--identity-slot") == 0 && i + 1 < argc) {
             cfg->identity_slot = (int16_t)atoi(argv[++i]);
+            continue;
+        }
+        if (strcmp(argv[i], "--identity-param") == 0 && i + 1 < argc) {
+            cfg->identity_param_name = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--msg-zerocopy") == 0) {
+            cfg->msg_zerocopy = 1;
             continue;
         }
         if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {

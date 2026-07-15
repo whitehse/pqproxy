@@ -92,6 +92,7 @@ typedef struct {
     int             recv_pending;
     int             poll_pending;
     int             want_poll_out;
+    int             zerocopy_ok; /* SO_ZEROCOPY armed on this fd */
 
     /* Async backend pipeline */
     pqproxy_backend_conn_t *be;
@@ -346,10 +347,18 @@ static int submit_recv(server_t *srv, conn_t *c)
     return 0;
 }
 
+#ifndef SO_ZEROCOPY
+#define SO_ZEROCOPY 60
+#endif
+#ifndef MSG_ZEROCOPY
+#define MSG_ZEROCOPY 0x4000000
+#endif
+
 static int submit_send(server_t *srv, conn_t *c)
 {
     struct io_uring_sqe *sqe;
     size_t n;
+    int flags = 0;
     if (c->ssl || c->send_pending || c->send_off >= c->send_len) {
         return 0;
     }
@@ -358,7 +367,12 @@ static int submit_send(server_t *srv, conn_t *c)
     if (!sqe) {
         return -1;
     }
-    io_uring_prep_send(sqe, c->fd, c->send_buf + c->send_off, n, 0);
+    /* MSG_ZEROCOPY only for plain sockets with SO_ZEROCOPY set; completion
+     * notifications are ignored (best-effort path for large FE replies). */
+    if (c->zerocopy_ok && !c->ssl && n >= 4096) {
+        flags = MSG_ZEROCOPY;
+    }
+    io_uring_prep_send(sqe, c->fd, c->send_buf + c->send_off, n, flags);
     io_uring_sqe_set_data64(sqe, pack_ud(OP_SEND, c->slot));
     c->send_pending = 1;
     return 0;
@@ -909,10 +923,11 @@ static int drain_fe_queue(server_t *srv, conn_t *c)
         int rc = 0;
         switch (it.kind) {
         case FEQ_PARSE:
-            rc = pqproxy_on_parse(c->frontend, &c->cache, &it.parse,
-                                  c->id.identity_slot >= 0
-                                      ? c->id.identity_slot
-                                      : srv->cfg->identity_slot);
+            rc = pqproxy_on_parse_ex(c->frontend, &c->cache, &it.parse,
+                                     c->id.identity_slot >= 0
+                                         ? c->id.identity_slot
+                                         : srv->cfg->identity_slot,
+                                     srv->cfg->identity_param_name);
             if (rc != 0) {
                 (void)pqwire_send_error_response(c->frontend, "ERROR", "26000",
                                                  "prepared statement cache full");
@@ -1047,10 +1062,11 @@ static int process_frontend(server_t *srv, conn_t *c)
                 }
                 break;
             }
-            if (pqproxy_on_parse(c->frontend, &c->cache, &ev.payload.parse,
-                                 c->id.identity_slot >= 0
-                                     ? c->id.identity_slot
-                                     : srv->cfg->identity_slot) != 0) {
+            if (pqproxy_on_parse_ex(c->frontend, &c->cache, &ev.payload.parse,
+                                    c->id.identity_slot >= 0
+                                        ? c->id.identity_slot
+                                        : srv->cfg->identity_slot,
+                                    srv->cfg->identity_param_name) != 0) {
                 (void)pqwire_send_error_response(c->frontend, "ERROR", "26000",
                                                  "prepared statement cache full");
                 (void)pqwire_send_ready_for_query(c->frontend);
@@ -1352,6 +1368,16 @@ static int accept_one(server_t *srv, int fd)
     c->fd = fd;
     (void)set_nonblock(fd);
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+    c->zerocopy_ok = 0;
+    if (srv->cfg->msg_zerocopy) {
+        int zc = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_ZEROCOPY, &zc, sizeof(zc)) == 0) {
+            c->zerocopy_ok = 1;
+        } else if (!srv->cfg->quiet) {
+            fprintf(stderr, "pqproxy: SO_ZEROCOPY unavailable (%s)\n",
+                    strerror(errno));
+        }
+    }
 
     c->frontend = pqwire_create(PQWIRE_ROLE_SERVER);
     if (!c->frontend) {
@@ -1431,6 +1457,8 @@ void pqproxy_config_defaults(pqproxy_config_t *cfg)
     cfg->fair_schedule = 1;
     cfg->reject_simple_query = 1;
     cfg->log_json = 0;
+    cfg->identity_param_name = NULL;
+    cfg->msg_zerocopy = 0;
 }
 
 int pqproxy_run(const pqproxy_config_t *cfg)

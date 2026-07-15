@@ -18,6 +18,8 @@ tls:
 identity:
   # Bind parameter index overwritten with verified router_id from mTLS
   slot: 0
+  # Optional: resolve slot from INSERT column list (e.g. router_id → $N)
+  # param: router_id
 
 backend:
   host: 127.0.0.1

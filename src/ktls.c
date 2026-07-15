@@ -64,15 +64,21 @@ int pqproxy_ktls_note_after_handshake(SSL *ssl, int quiet)
 {
     int tx = 0, rx = 0;
     const char *cipher;
+    int ktls_tx_zc = 0;
 
     if (!ssl) {
         return -1;
     }
     (void)pqproxy_ktls_query(ssl, &tx, &rx);
     cipher = SSL_get_cipher_name(ssl);
+#ifdef SSL_OP_ENABLE_KTLS_TX_ZEROCOPY_SENDFILE
+    ktls_tx_zc = 1; /* option was set on SSL_CTX; actual arm depends on cipher */
+#endif
     if (!quiet) {
-        fprintf(stderr, "pqproxy: TLS handshake ok cipher=%s ktls_tx=%d ktls_rx=%d\n",
-                cipher ? cipher : "?", tx, rx);
+        fprintf(stderr,
+                "pqproxy: TLS handshake ok cipher=%s ktls_tx=%d ktls_rx=%d "
+                "ktls_tx_zerocopy_sendfile=%d\n",
+                cipher ? cipher : "?", tx, rx, ktls_tx_zc);
     }
     /* Returning 1 if either direction offloaded; 0 if software path. */
     return (tx || rx) ? 1 : 0;

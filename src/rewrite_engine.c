@@ -1,5 +1,6 @@
 #include "pqproxy.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -151,29 +152,170 @@ int pqproxy_stmt_cache_remove(pqproxy_stmt_cache_t *cache, const char *name)
     return -1;
 }
 
-int pqproxy_on_parse(pqwire_ctx_t *frontend, pqproxy_stmt_cache_t *cache,
-                     const pq_parse_t *parse, int16_t identity_slot)
+static int is_ident_char(char c)
 {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '"';
+}
+
+static int name_eq_ci(const char *a, size_t alen, const char *b)
+{
+    size_t i, blen;
+    if (!a || !b) {
+        return 0;
+    }
+    blen = strlen(b);
+    if (alen != blen) {
+        return 0;
+    }
+    for (i = 0; i < alen; i++) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') {
+            ca = (char)(ca - 'A' + 'a');
+        }
+        if (cb >= 'A' && cb <= 'Z') {
+            cb = (char)(cb - 'A' + 'a');
+        }
+        if (ca != cb) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int16_t pqproxy_resolve_identity_slot(const char *query, const char *param_name,
+                                      int16_t fallback)
+{
+    const char *p, *cols, *end, *q;
+    int idx;
+    char namebuf[64];
+    size_t nlen;
+
+    if (!param_name || !param_name[0]) {
+        return fallback;
+    }
+
+    /* Numeric or $N */
+    if (param_name[0] == '$') {
+        return (int16_t)atoi(param_name + 1) - 1; /* $1 → 0 */
+    }
+    {
+        int all_digit = 1;
+        const char *s;
+        for (s = param_name; *s; s++) {
+            if (*s < '0' || *s > '9') {
+                all_digit = 0;
+                break;
+            }
+        }
+        if (all_digit) {
+            return (int16_t)atoi(param_name);
+        }
+    }
+
+    if (!query || !query[0]) {
+        return fallback;
+    }
+
+    /* Find first '(' after INSERT or after table name for column list before VALUES */
+    p = query;
+    cols = NULL;
+    while (*p) {
+        /* case-insensitive "values" stops search for column list start */
+        if ((p[0] == 'v' || p[0] == 'V') &&
+            (p[1] == 'a' || p[1] == 'A') &&
+            (p[2] == 'l' || p[2] == 'L') &&
+            (p[3] == 'u' || p[3] == 'U') &&
+            (p[4] == 'e' || p[4] == 'E') &&
+            (p[5] == 's' || p[5] == 'S') &&
+            !is_ident_char(p[6])) {
+            break;
+        }
+        if (*p == '(') {
+            cols = p + 1;
+            /* keep scanning — last '(' before VALUES is the column list */
+        }
+        p++;
+    }
+    if (!cols) {
+        return fallback;
+    }
+    end = p; /* at VALUES or EOS */
+    idx = 0;
+    q = cols;
+    while (q < end) {
+        /* skip space */
+        while (q < end && (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r')) {
+            q++;
+        }
+        if (q >= end || *q == ')') {
+            break;
+        }
+        nlen = 0;
+        if (*q == '"') {
+            q++;
+            while (q < end && *q != '"' && nlen + 1 < sizeof(namebuf)) {
+                namebuf[nlen++] = *q++;
+            }
+            if (q < end && *q == '"') {
+                q++;
+            }
+        } else {
+            while (q < end && is_ident_char(*q) && *q != '"' &&
+                   nlen + 1 < sizeof(namebuf)) {
+                namebuf[nlen++] = *q++;
+            }
+        }
+        namebuf[nlen] = '\0';
+        if (nlen > 0 && name_eq_ci(namebuf, nlen, param_name)) {
+            return (int16_t)idx;
+        }
+        /* skip to next comma or end */
+        while (q < end && *q != ',' && *q != ')') {
+            q++;
+        }
+        if (q < end && *q == ',') {
+            q++;
+            idx++;
+        } else {
+            break;
+        }
+    }
+    return fallback;
+}
+
+int pqproxy_on_parse_ex(pqwire_ctx_t *frontend, pqproxy_stmt_cache_t *cache,
+                        const pq_parse_t *parse, int16_t identity_slot,
+                        const char *param_name)
+{
+    int16_t slot = identity_slot;
     if (!frontend || !cache || !parse) {
         return -1;
     }
-    if (pqproxy_stmt_cache_put(cache, parse, identity_slot) != 0) {
+    if (param_name && param_name[0]) {
+        int16_t resolved = pqproxy_resolve_identity_slot(parse->query, param_name,
+                                                         identity_slot);
+        if (resolved >= 0) {
+            slot = resolved;
+        }
+    }
+    if (pqproxy_stmt_cache_put(cache, parse, slot) != 0) {
         return -1;
     }
     return pqwire_send_parse_complete(frontend);
+}
+
+int pqproxy_on_parse(pqwire_ctx_t *frontend, pqproxy_stmt_cache_t *cache,
+                     const pq_parse_t *parse, int16_t identity_slot)
+{
+    return pqproxy_on_parse_ex(frontend, cache, parse, identity_slot, NULL);
 }
 
 int pqproxy_on_bind(pqwire_ctx_t *backend, const pqproxy_stmt_cache_t *cache,
                     const pq_bind_t *bind, const pqproxy_identity_t *id)
 {
     const pqwire_prepared_stmt_t *prep;
-    pqwire_param_t params[PQWIRE_MAX_BIND_PARAMS];
-    int16_t formats[PQWIRE_MAX_BIND_PARAMS];
-    int32_t lengths[PQWIRE_MAX_BIND_PARAMS];
-    const uint8_t *values[PQWIRE_MAX_BIND_PARAMS];
     int16_t slot;
-    uint16_t i;
-    int rc = -1;
 
     if (!backend || !cache || !bind || !id) {
         return -1;
@@ -192,42 +334,49 @@ int pqproxy_on_bind(pqwire_ctx_t *backend, const pqproxy_stmt_cache_t *cache,
         return -1;
     }
 
-    memset(params, 0, sizeof(params));
-    for (i = 0; i < PQWIRE_MAX_BIND_PARAMS; i++) {
-        params[i].length = -1;
-    }
-
-    if (pqwire_bind_inject_identity(bind, params, (uint16_t)slot,
-                                    id->router_id, 0) != 0) {
-        return -1;
-    }
-
-    for (i = 0; i < bind->n_params; i++) {
-        formats[i] = params[i].format;
-        lengths[i] = params[i].length;
-        values[i] = params[i].data;
-    }
-
     if (pqwire_send_parse(backend, "", prep->query,
                           prep->param_type_oids, prep->n_param_types) != 0) {
-        goto out;
+        return -1;
     }
-    if (pqwire_send_bind(backend, "", "",
-                         formats, bind->n_params,
-                         lengths, values, bind->n_params,
-                         bind->result_formats, bind->n_result_formats) != 0) {
-        goto out;
+    /* Prefer slice-based rewrite (no malloc of other params). */
+    if (pqwire_send_bind_rewrite_identity(backend, bind, "", "",
+                                          (uint16_t)slot, id->router_id, 0) != 0) {
+        /* Fallback: owned-param inject path */
+        pqwire_param_t params[PQWIRE_MAX_BIND_PARAMS];
+        int16_t formats[PQWIRE_MAX_BIND_PARAMS];
+        int32_t lengths[PQWIRE_MAX_BIND_PARAMS];
+        const uint8_t *values[PQWIRE_MAX_BIND_PARAMS];
+        uint16_t i;
+        int rc = -1;
+
+        memset(params, 0, sizeof(params));
+        for (i = 0; i < PQWIRE_MAX_BIND_PARAMS; i++) {
+            params[i].length = -1;
+        }
+        if (pqwire_bind_inject_identity(bind, params, (uint16_t)slot,
+                                        id->router_id, 0) != 0) {
+            return -1;
+        }
+        for (i = 0; i < bind->n_params; i++) {
+            formats[i] = params[i].format;
+            lengths[i] = params[i].length;
+            values[i] = params[i].data;
+        }
+        rc = pqwire_send_bind(backend, "", "",
+                              formats, bind->n_params,
+                              lengths, values, bind->n_params,
+                              bind->result_formats, bind->n_result_formats);
+        for (i = 0; i < bind->n_params; i++) {
+            pqwire_param_clear(&params[i]);
+        }
+        if (rc != 0) {
+            return -1;
+        }
     }
     if (pqwire_send_execute(backend, "", 0) != 0) {
-        goto out;
+        return -1;
     }
-    rc = pqwire_send_sync(backend);
-
-out:
-    for (i = 0; i < bind->n_params; i++) {
-        pqwire_param_clear(&params[i]);
-    }
-    return rc;
+    return pqwire_send_sync(backend);
 }
 
 int pqproxy_on_simple_query(pqwire_ctx_t *frontend, int reject_simple_query,

@@ -38,15 +38,31 @@ const pqwire_prepared_stmt_t *pqproxy_stmt_cache_get(const pqproxy_stmt_cache_t 
 int pqproxy_stmt_cache_remove(pqproxy_stmt_cache_t *cache, const char *name);
 
 /**
+ * Resolve Bind param index for identity from a SQL string.
+ * - param_name NULL/empty → returns fallback
+ * - numeric name ("0","1") or "$1" → that index
+ * - column name: finds INSERT INTO t (..., name, ...) VALUES and maps position
+ * Returns fallback if unresolved; -1 if fallback is -1 and unresolved.
+ */
+int16_t pqproxy_resolve_identity_slot(const char *query, const char *param_name,
+                                      int16_t fallback);
+
+/**
  * Handle a frontend Parse event: cache statement, emit local ParseComplete
  * on frontend_out (server role). Does not touch the backend.
+ * When param_name is non-NULL, slot is resolved from query if possible.
  */
 int pqproxy_on_parse(pqwire_ctx_t *frontend, pqproxy_stmt_cache_t *cache,
                      const pq_parse_t *parse, int16_t identity_slot);
 
+int pqproxy_on_parse_ex(pqwire_ctx_t *frontend, pqproxy_stmt_cache_t *cache,
+                        const pq_parse_t *parse, int16_t identity_slot,
+                        const char *param_name);
+
 /**
  * Handle a frontend Bind: inject identity into parameter slot, emit
  * unnamed Parse+Bind+Execute+Sync on backend (client role).
+ * Prefer slice-based Bind rewrite (no per-param malloc for non-identity).
  */
 int pqproxy_on_bind(pqwire_ctx_t *backend, const pqproxy_stmt_cache_t *cache,
                     const pq_bind_t *bind, const pqproxy_identity_t *id);
@@ -91,8 +107,10 @@ typedef struct {
     const char *ca_file;       /* client CA for mTLS verify */
     int         plain;         /* 1 = no TLS (dev only) */
     int         require_mtls;  /* 1 = require client cert (default when !plain) */
-    int16_t     identity_slot; /* Bind param slot for router_id */
+    int16_t     identity_slot; /* Bind param slot for router_id (fallback) */
+    const char *identity_param_name; /* optional column/name → slot (e.g. router_id) */
     int         quiet;         /* less stderr logging */
+    int         msg_zerocopy;  /* enable SO_ZEROCOPY on sockets when available */
 
     /* Optional identity-grouped backend pool */
     const char *backend_host;  /* NULL = no pool (local stub only) */

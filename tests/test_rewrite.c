@@ -207,6 +207,83 @@ static void test_simple_query_policy(void)
     pqwire_destroy(fe);
 }
 
+static void test_identity_slot_by_name(void)
+{
+    const char *sql =
+        "INSERT INTO events(router_id, payload, ts) VALUES ($1, $2, $3)";
+    assert(pqproxy_resolve_identity_slot(sql, "router_id", -1) == 0);
+    assert(pqproxy_resolve_identity_slot(sql, "payload", -1) == 1);
+    assert(pqproxy_resolve_identity_slot(sql, "ts", -1) == 2);
+    assert(pqproxy_resolve_identity_slot(sql, "$2", -1) == 1);
+    assert(pqproxy_resolve_identity_slot(sql, "1", -1) == 1);
+    assert(pqproxy_resolve_identity_slot(sql, "missing", 7) == 7);
+    assert(pqproxy_resolve_identity_slot(sql, NULL, 3) == 3);
+    printf("  PASS: identity slot by name\n");
+}
+
+static void test_zerocopy_bind_rewrite(void)
+{
+    pqwire_ctx_t *client = pqwire_create(PQWIRE_ROLE_CLIENT);
+    pqwire_ctx_t *server = pqwire_create(PQWIRE_ROLE_SERVER);
+    uint8_t startup[64], wire[2048], out[2048];
+    size_t n, sp, out_len = 0;
+    int32_t lengths[2];
+    const uint8_t *values[2];
+    int16_t formats[2] = {0, 0};
+    protocol_event_t ev;
+    int saw = 0;
+
+    assert(client && server);
+    sp = write_startup(startup, sizeof(startup));
+    pqwire_feed_input(server, startup, sp);
+    while (pqwire_next_event(server, &ev)) {
+    }
+
+    lengths[0] = (int32_t)strlen("forged");
+    values[0] = (const uint8_t *)"forged";
+    lengths[1] = (int32_t)strlen("body");
+    values[1] = (const uint8_t *)"body";
+    assert(pqwire_send_bind(client, "p", "st", formats, 2,
+                            lengths, values, 2, NULL, 0) == 0);
+    n = pqwire_get_output(client, wire, sizeof(wire));
+    assert(n > 0);
+    pqwire_feed_input(server, wire, n);
+    while (pqwire_next_event(server, &ev) == 1) {
+        if (ev.type == PQ_EVENT_BIND) {
+            assert(pqwire_bind_rewrite_identity_zerocopy(
+                       &ev.payload.bind, "", "", 0, "router-Z", 0,
+                       out, sizeof(out), &out_len) == 0);
+            assert(out_len >= 5 && out[0] == 'B');
+            /* re-parse rewritten bind */
+            {
+                pqwire_ctx_t *srv2 = pqwire_create(PQWIRE_ROLE_SERVER);
+                uint8_t st2[64];
+                size_t s2 = write_startup(st2, sizeof(st2));
+                protocol_event_t ev2;
+                pqwire_feed_input(srv2, st2, s2);
+                while (pqwire_next_event(srv2, &ev2)) {
+                }
+                pqwire_feed_input(srv2, out, out_len);
+                while (pqwire_next_event(srv2, &ev2) == 1) {
+                    if (ev2.type == PQ_EVENT_BIND) {
+                        saw = 1;
+                        assert(ev2.payload.bind.n_params >= 1);
+                        assert(ev2.payload.bind.params[0].length ==
+                               (int32_t)strlen("router-Z"));
+                        assert(memcmp(ev2.payload.bind.params[0].data, "router-Z",
+                                      8) == 0);
+                    }
+                }
+                pqwire_destroy(srv2);
+            }
+        }
+    }
+    assert(saw);
+    pqwire_destroy(client);
+    pqwire_destroy(server);
+    printf("  PASS: zerocopy bind rewrite\n");
+}
+
 static void test_pipeline_error_observe(void)
 {
     /* Dialectic without live PG: Error then RFQ status */
@@ -245,6 +322,8 @@ int main(void)
     test_stmt_hash_cache();
     test_simple_query_policy();
     test_pipeline_error_observe();
+    test_identity_slot_by_name();
+    test_zerocopy_bind_rewrite();
     printf("rewrite engine tests PASSED\n");
     return 0;
 }
