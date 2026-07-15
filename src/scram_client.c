@@ -30,10 +30,13 @@ static int b64_decode(const char *in, uint8_t *out, size_t out_cap, size_t *out_
     size_t in_len = strlen(in);
     int n;
     int pad = 0;
-    if (in_len == 0 || (in_len % 4) != 0) {
+    /* EVP_DecodeBlock may write 3*((in_len+3)/4) bytes including pad zeros */
+    uint8_t tmp[256];
+    size_t max_out = (in_len / 4) * 3 + 3;
+    if (in_len == 0 || (in_len % 4) != 0 || max_out > sizeof(tmp)) {
         return -1;
     }
-    n = EVP_DecodeBlock(out, (const unsigned char *)in, (int)in_len);
+    n = EVP_DecodeBlock(tmp, (const unsigned char *)in, (int)in_len);
     if (n < 0) {
         return -1;
     }
@@ -47,6 +50,7 @@ static int b64_decode(const char *in, uint8_t *out, size_t out_cap, size_t *out_
     if (n < 0 || (size_t)n > out_cap) {
         return -1;
     }
+    memcpy(out, tmp, (size_t)n);
     *out_len = (size_t)n;
     return 0;
 }
@@ -55,8 +59,10 @@ static int hmac_sha256(const uint8_t *key, size_t key_len,
                        const uint8_t *data, size_t data_len,
                        uint8_t out[32])
 {
-    unsigned int len = 32;
-    if (!HMAC(EVP_sha256(), key, (int)key_len, data, data_len, out, &len)) {
+    unsigned int len = 0;
+    unsigned char *ret = HMAC(EVP_sha256(), key, (int)key_len, data, data_len,
+                              out, &len);
+    if (ret == NULL || len != 32) {
         return -1;
     }
     return 0;
@@ -329,8 +335,13 @@ int pq_scram_verify_server_final(pq_scram_t *s, const char *server_final)
     if (b64_decode(v_b64, got, sizeof(got), &got_len) != 0 || got_len != 32) {
         return -1;
     }
-    for (i = 0; i < 32; i++) {
-        if (expected[i] != got[i]) {
+    /* Constant-time compare */
+    {
+        uint8_t diff = 0;
+        for (i = 0; i < 32; i++) {
+            diff |= (uint8_t)(expected[i] ^ got[i]);
+        }
+        if (diff != 0) {
             return -1;
         }
     }
