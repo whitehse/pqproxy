@@ -14,10 +14,11 @@ Further work to explore. Ordered roughly by dependency.
 
 ## I/O and TLS
 
-- [ ] io_uring accept/read/write/sendmsg path (fixed buffers)
-- [ ] OpenSSL accept + client cert required
-- [ ] Extract router_id / tenant from cert (SAN URI or CN convention)
-- [ ] kTLS `SOL_TLS` TX/RX after handshake
+- [x] io_uring accept/recv/send (plain) and POLL (TLS) path
+- [x] OpenSSL mTLS via `SSL_set_fd` + client cert required
+- [x] Extract router_id / group from cert (CN + OU)
+- [x] `SSL_OP_ENABLE_KTLS` + log ktls_tx/rx when kernel arms offload
+- [ ] Broader kTLS coverage (TLS 1.2 AES-GCM profile, zerocopy sendfile)
 - [ ] MSG_ZEROCOPY / buffer slice writes to backends
 
 ## Connection pool
